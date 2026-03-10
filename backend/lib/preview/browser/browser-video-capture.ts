@@ -31,6 +31,7 @@ import type { Page } from 'puppeteer';
 import type { BrowserTab, StreamingConfig } from './types';
 import { DEFAULT_STREAMING_CONFIG } from './types';
 import { videoEncoderScript } from './scripts/video-stream';
+import { audioCaptureScript } from './scripts/audio-stream';
 import { debug } from '$shared/utils/logger';
 
 interface VideoStreamSession {
@@ -157,7 +158,8 @@ export class BrowserVideoCapture extends EventEmitter {
 			// Inject persistent video encoder script (survives navigation)
 			// Only inject once per page instance
 			if (!videoSession.scriptInjected) {
-				await page.evaluateOnNewDocument(videoEncoderScript, videoConfig);
+				// Temporarily disable evaluateOnNewDocument for evasion test
+				// await page.evaluateOnNewDocument(videoEncoderScript, videoConfig);
 				videoSession.scriptInjected = true;
 				debug.log('webcodecs', `Persistent video encoder script injected for ${sessionId}`);
 			}
@@ -165,6 +167,12 @@ export class BrowserVideoCapture extends EventEmitter {
 			// Also inject immediately for current page context
 			// (evaluateOnNewDocument only runs on NEXT navigation)
 			await page.evaluate(videoEncoderScript, videoConfig);
+
+			// Inject audio capture script post-navigation to avoid CF detection.
+			// Using page.evaluate() instead of evaluateOnNewDocument() ensures
+			// AudioContext patching happens AFTER Cloudflare challenges pass,
+			// preventing fingerprint detection of constructor interception.
+			await page.evaluate(audioCaptureScript, config.audio);
 
 			// Verify peer was created
 			const peerExists = await page.evaluate(() => {
@@ -570,6 +578,9 @@ export class BrowserVideoCapture extends EventEmitter {
 
 			await page.evaluate(videoEncoderScript, videoConfig);
 
+			// Re-inject audio capture script for new page context (post-navigation)
+			await page.evaluate(audioCaptureScript, config.audio);
+
 			// Verify peer was re-created
 			const peerExists = await page.evaluate(() => {
 				return typeof (window as any).__webCodecsPeer?.startStreaming === 'function';
@@ -588,6 +599,25 @@ export class BrowserVideoCapture extends EventEmitter {
 			if (!started) {
 				debug.error('webcodecs', `Failed to start streaming on new page`);
 				return false;
+			}
+
+			// Re-initialize and start audio capture after navigation
+			try {
+				const audioReady = await page.evaluate(async () => {
+					const encoder = (window as any).__audioEncoder;
+					if (!encoder) return false;
+					const initiated = await encoder.init();
+					if (initiated) return encoder.start();
+					return false;
+				});
+
+				if (audioReady) {
+					debug.log('webcodecs', 'Audio re-initialized after navigation');
+				} else {
+					debug.warn('webcodecs', 'Audio not available after navigation, continuing with video only');
+				}
+			} catch {
+				debug.warn('webcodecs', 'Audio re-init failed after navigation, continuing with video only');
 			}
 
 			// Restart CDP screencast
@@ -631,6 +661,11 @@ export class BrowserVideoCapture extends EventEmitter {
 
 		if (session?.page && !session.page.isClosed()) {
 			try {
+				// Stop audio encoder
+				await session.page.evaluate(() => {
+					(window as any).__audioEncoder?.stop();
+				}).catch(() => {});
+
 				// Stop peer
 				await session.page.evaluate(() => {
 					(window as any).__webCodecsPeer?.stopStreaming();
