@@ -323,6 +323,28 @@ export interface EnterPlanModeToolInput {
   metadata?: ToolMetadata;
 }
 
+/**
+ * Skill tool input — manually defined (not from SDK).
+ *
+ * Neither @anthropic-ai/claude-agent-sdk nor @opencode-ai/sdk export a
+ * SkillInput type. The shape is inferred from observed tool_use payloads
+ * where `input.skill` is the slash-command name and `input.args` is an
+ * optional argument string.
+ */
+export interface SkillToolInput {
+  type: 'tool_use';
+  id: string;
+  name: 'Skill';
+  input: {
+    skill: string;
+    args?: string;
+  };
+  $result?: ToolResult;
+  /** Expanded skill prompt (from synthetic user message) */
+  $skillPrompt?: string;
+  metadata?: ToolMetadata;
+}
+
 // ============================================================
 // Union of All Tool Input Types
 // ============================================================
@@ -348,4 +370,5 @@ export type ToolInput =
   | ConfigToolInput
   | EnterWorktreeToolInput
   | AgentToolInput
-  | EnterPlanModeToolInput;
+  | EnterPlanModeToolInput
+  | SkillToolInput;
