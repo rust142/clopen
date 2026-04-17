@@ -150,7 +150,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines and [DECISIONS.md](DECISIO
 | Terminal | bun-pty |
 | AI Engines | Claude Code + OpenCode |
 
-Clopen uses an engine-agnostic adapter pattern — both engines normalize output to Claude SDK message format, ensuring a consistent experience regardless of which engine is selected.
+Clopen uses an engine-agnostic adapter pattern — both engines normalize output to a unified message format (`shared/types/unified`), ensuring a consistent experience regardless of which engine is selected.
 
 ---
 

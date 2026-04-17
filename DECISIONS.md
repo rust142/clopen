@@ -66,8 +66,8 @@
 
 ### 8. Engine-Agnostic Adapter Pattern
 
-**Decision:** Adapter pattern for AI engines, all normalizing output to Claude SDK message format
-**Rationale:** Frontend and stream manager remain engine-agnostic. Each engine evolves independently. Per-project engine isolation prevents cross-project state leaks.
+**Decision:** Adapter pattern for AI engines, all normalizing output to a unified message format (`shared/types/unified`)
+**Rationale:** Frontend and stream manager remain engine-agnostic. Each engine evolves independently. Per-project engine isolation prevents cross-project state leaks. Type system is centralized in `shared/types/unified/` — no coupling to any specific SDK's message format.
 **Trade-offs:** Added abstraction layer, OpenCode requires a background server process.
 
 ---
