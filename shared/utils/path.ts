@@ -1,6 +1,6 @@
 /**
- * Shared path normalization utilities.
- * Normalizes path separators to forward slashes for consistent display and comparison.
+ * Shared path utilities (browser-safe, no Node imports).
+ * - normalizePath / pathsEqual / getRelativePath: forward-slash display/comparison
  */
 
 /**
@@ -45,3 +45,4 @@ export function getRelativePath(fullPath: string, basePath: string): string {
 
 	return normalizePath(fullPath);
 }
+

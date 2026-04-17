@@ -37,7 +37,7 @@
 	import EngineModelPicker from './components/EngineModelPicker.svelte';
 
 	// Composables
-	import { useFileHandling } from './composables/use-file-handling.svelte';
+	import { useFileHandling, buildAcceptedMimeTypes } from './composables/use-file-handling.svelte';
 	import { usePlaceholderAnimation, useLoadingTextAnimation } from './composables/use-animations.svelte';
 	import { useTextareaResize } from './composables/use-textarea-resize.svelte';
 	import { useChatActions } from './composables/use-chat-actions.svelte';
@@ -93,24 +93,31 @@
 
 	// Enhanced model info based on user settings
 	const modelInfo = $derived.by(() => {
-		const selectedModel = settings.selectedModel;
-		const model = modelStore.getById(selectedModel);
-		const modelName = model?.name || 'AI Assistant';
+		const selectedModelId = settings.selectedModelId;
+		const model = modelStore.getById(selectedModelId);
+		const modelName = model?.engine.model.name || 'AI Assistant';
 		const engineInfo = getEngineInfo(settings.selectedEngine);
 
 		return {
 			name: modelName,
 			description: engineInfo?.description || 'AI-powered development assistant',
 			icon: 'lucide:brain-circuit' as IconName,
-			model: selectedModel
+			modelId: selectedModelId
 		};
 	});
 
-	// Check if the current model supports file attachments
-	const modelSupportsAttachments = $derived.by(() => {
-		const model = modelStore.getById(chatModelState.model);
-		if (!model) return true; // Default to enabled if model not found
-		return model.capabilities.some(c => c.toLowerCase() === 'attachments');
+	// Accepted MIME types based on model's input modalities
+	const acceptedMimeTypes = $derived.by(() => {
+		const model = modelStore.getById(chatModelState.modelId);
+		if (!model) return buildAcceptedMimeTypes({ image: true, pdf: true, audio: false, video: false });
+		return buildAcceptedMimeTypes(model.modalities.input);
+	});
+
+	const modelSupportsAttachments = $derived(acceptedMimeTypes.length > 0);
+
+	// Sync allowed types to the file handling composable when model changes
+	$effect(() => {
+		fileHandling.allowedTypes = acceptedMimeTypes;
 	});
 
 	// Check if we're in welcome state (no messages)
@@ -127,7 +134,7 @@
 				return 'no-claude-account' as const;
 			}
 		} else {
-			if (!chatModelState.model) {
+			if (!chatModelState.modelId) {
 				return 'no-model' as const;
 			}
 		}
@@ -270,62 +277,31 @@
 		if (!activeStream) return;
 
 		try {
-			const streamState = await ws.http('chat:background-state', {
+			const streamState = await ws.http('chat:stream-state', {
 				chatSessionId: sessionState.currentSession.id
 			});
 
 			if (streamState && streamState.status === 'active' && streamState.processId) {
-				// ── Inject reasoning stream_event (if available) ──
-				if (streamState.currentReasoningText) {
-					const hasReasoningStream = sessionState.messages.some(
-						(m: any) => m.type === 'stream_event' && m.metadata?.reasoning && m.processId === streamState.processId
-					);
-
-					if (!hasReasoningStream) {
-						const reasoningMessage = {
-							type: 'stream_event' as const,
-							processId: streamState.processId,
-							partialText: streamState.currentReasoningText,
-							metadata: { reasoning: true }
-						};
-						(sessionState.messages as any[]).push(reasoningMessage);
-					} else {
-						const existingReasoning = sessionState.messages.find(
-							(m: any) => m.type === 'stream_event' && m.metadata?.reasoning && m.processId === streamState.processId
-						);
-						if (existingReasoning) {
-							(existingReasoning as any).partialText = streamState.currentReasoningText;
-						}
-					}
-				}
-
-				// ── Inject regular text stream_event (if available) ──
+				// ── Inject text stream_event (if available) ──
 				if (streamState.currentPartialText) {
-					const hasTextStream = sessionState.messages.some(
-						(m: any) => m.type === 'stream_event' && !m.metadata?.reasoning && m.processId === streamState.processId
+					const existingText = sessionState.messages.find(
+						(m: any) => m.type === 'stream_event' && m.processId === streamState.processId
 					);
 
-					if (!hasTextStream) {
-						const streamingMessage = {
+					if (!existingText) {
+						(sessionState.messages as any[]).push({
 							type: 'stream_event' as const,
 							processId: streamState.processId,
-							partialText: streamState.currentPartialText,
-							metadata: {}
-						};
-						(sessionState.messages as any[]).push(streamingMessage);
+							text: streamState.currentPartialText,
+							createdAt: new Date().toISOString(),
+						});
 					} else {
-						const existingMsg = sessionState.messages.find(
-							(m: any) => m.type === 'stream_event' && !m.metadata?.reasoning && m.processId === streamState.processId
-						);
-						if (existingMsg) {
-							(existingMsg as any).partialText = streamState.currentPartialText;
-						}
+						(existingText as any).text = streamState.currentPartialText;
 					}
 				}
 
-				// If neither text nor reasoning is available yet, inject an empty
-				// stream_event placeholder so the loading indicator is visible
-				if (!streamState.currentPartialText && !streamState.currentReasoningText) {
+				// If no text yet, inject an empty stream_event so the loading indicator is visible
+				if (!streamState.currentPartialText) {
 					const hasAnyStream = sessionState.messages.some(
 						(m: any) => m.type === 'stream_event' && m.processId === streamState.processId
 					);
@@ -333,8 +309,8 @@
 						(sessionState.messages as any[]).push({
 							type: 'stream_event' as const,
 							processId: streamState.processId,
-							partialText: '',
-							metadata: {}
+							text: '',
+							createdAt: new Date().toISOString(),
 						});
 					}
 				}
@@ -409,9 +385,7 @@
 		bind:this={fileInputElement}
 		type="file"
 		multiple
-		accept={[...fileHandling.SUPPORTED_IMAGE_TYPES, ...fileHandling.SUPPORTED_DOCUMENT_TYPES].join(
-			','
-		)}
+		accept={acceptedMimeTypes.join(',')}
 		onchange={fileHandling.handleFileInputChange}
 		class="hidden"
 	/>

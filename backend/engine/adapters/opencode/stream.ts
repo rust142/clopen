@@ -2,16 +2,16 @@
  * Open Code Engine Adapter
  *
  * Wraps the @opencode-ai/sdk into the AIEngine interface.
- * Converts Open Code messages/events → SDKMessage (Claude format)
- * so stream-manager and frontend remain unchanged.
+ * Converts Open Code messages/events → EngineOutput (unified types)
+ * so stream-manager and frontend remain engine-agnostic.
  *
  * Server lifecycle is managed by ./server.ts (Bun.spawn).
  * This file only contains the OpenCodeEngine class (per-project instance).
  */
 
-import type { SDKMessage, SDKUserMessage, EngineSDKMessage } from '$shared/types/messaging';
+import type { EngineOutput, UserMessage } from '$shared/types/unified';
 import type { AIEngine, EngineQueryOptions, StructuredGenerationOptions } from '../../types';
-import type { EngineModel } from '$shared/types/engine';
+import type { EngineModel } from '$shared/types/unified';
 import type {
 	Provider,
 	Model,
@@ -42,27 +42,6 @@ import {
 } from './message-converter';
 import { ensureClient, getClient, getServerUrl } from './server';
 import { debug } from '$shared/utils/logger';
-
-/** Map SDK Model.status to our category */
-function mapStatusToCategory(status: Model['status']): EngineModel['category'] {
-	switch (status) {
-		case 'deprecated': return 'legacy';
-		case 'alpha':
-		case 'beta': return 'stable';
-		default: return 'latest';
-	}
-}
-
-/** Build capability tags from SDK Model.capabilities */
-function buildCapabilityTags(model: Model): string[] {
-	const tags: string[] = [];
-	const caps = model.capabilities;
-
-	if (caps.reasoning) tags.push('Reasoning');
-	if (caps.attachment) tags.push('Attachments');
-
-	return tags;
-}
 
 // ============================================================================
 // OpenCode Engine (per-project instance)
@@ -123,19 +102,48 @@ export class OpenCodeEngine implements AIEngine {
 				const providerModels: Record<string, Model> = provider.models ?? {};
 
 				for (const [modelKey, model] of Object.entries(providerModels)) {
-					const modelId = model.id || modelKey;
-					const compoundId = `opencode:${provider.id}/${modelId}`;
-
 					models.push({
-						id: compoundId,
-						engine: 'opencode',
-						modelId: `${provider.id}/${modelId}`,
-						name: model.name || modelId,
-						provider: provider.id,
-						description: `${model.name || modelId} via ${provider.name || provider.id}`,
-						capabilities: buildCapabilityTags(model),
-						contextWindow: model.limit.context,
-						category: mapStatusToCategory(model.status),
+						engine: {
+							type: 'opencode',
+							provider: provider.id,
+							model: {
+								id: model.id,
+								name: model.name,
+							},
+							account: {
+								id: 0,
+								name: '',
+							},
+						},
+						limit: {
+							input: model.limit.context,
+							output: model.limit.output,
+						},
+						modalities: {
+							input: {
+								text: model.capabilities.input.text,
+								image: model.capabilities.input.image,
+								audio: model.capabilities.input.audio,
+								video: model.capabilities.input.video,
+								pdf: model.capabilities.input.pdf,
+							},
+							output: {
+								text: model.capabilities.output.text,
+								image: model.capabilities.output.image,
+								audio: model.capabilities.output.audio,
+								video: model.capabilities.output.video,
+								pdf: model.capabilities.output.pdf,
+							},
+						},
+						capabilities: {
+							reasoning: model.capabilities.reasoning,
+							tools: model.capabilities.toolcall,
+							structuredOutput: true,
+						},
+						cost: {
+							input: model.cost.input,
+							output: model.cost.output,
+						},
 					});
 				}
 			}
@@ -150,19 +158,20 @@ export class OpenCodeEngine implements AIEngine {
 	}
 
 	/**
-	 * Stream a query through Open Code SDK, yielding SDKMessage (Claude format)
+	 * Stream a query through Open Code SDK, yielding EngineOutput (unified types)
 	 *
 	 * Flow: subscribe to events FIRST, then send prompt asynchronously.
 	 * This ensures no events are missed between sending and subscribing.
 	 */
-	async *streamQuery(options: EngineQueryOptions): AsyncGenerator<EngineSDKMessage, void, unknown> {
+	async *streamQuery(options: EngineQueryOptions): AsyncGenerator<EngineOutput, void, unknown> {
 		const client = await ensureClient();
 
 		const {
 			projectPath,
 			prompt,
 			resume,
-			model = 'claude-sonnet',
+			providerSlug,
+			modelId,
 			abortController
 		} = options;
 
@@ -204,7 +213,7 @@ export class OpenCodeEngine implements AIEngine {
 
 			this.activeSessionId = sessionId;
 
-			yield convertSystemInitMessage(sessionId, model);
+			yield convertSystemInitMessage(sessionId, modelId);
 			yield convertStreamStart(sessionId);
 
 			// 1. Subscribe to event stream FIRST (before sending prompt)
@@ -213,15 +222,12 @@ export class OpenCodeEngine implements AIEngine {
 				signal: this.activeAbortController.signal
 			});
 
-			// 2. Send prompt asynchronously (non-blocking) — parse "providerId/modelId"
-			const idx = model.indexOf('/');
-			const [providerID, modelID] = idx >= 0 ? [model.substring(0, idx), model.substring(idx + 1)] : ['', model];
-
+			// 2. Send prompt asynchronously (non-blocking)
 			client.session.promptAsync({
 				path: { id: sessionId },
 				body: {
 					parts: promptParts as any,
-					...(providerID && modelID ? { model: { providerID, modelID } } : {}),
+					...(providerSlug && modelId ? { model: { providerID: providerSlug, modelID: modelId } } : {}),
 				},
 				query: { directory: projectPath },
 			}).catch(error => {
@@ -973,61 +979,41 @@ export class OpenCodeEngine implements AIEngine {
 	}
 
 	/**
-	 * Extract prompt parts (text + file attachments) from SDKUserMessage.
-	 * Converts Claude-format image/document blocks to OpenCode FilePartInput format.
+	 * Extract prompt parts (text + file attachments) from UserMessage.
+	 * Converts unified content blocks to OpenCode FilePartInput format.
 	 */
-	private extractPromptParts(prompt: SDKUserMessage): Array<
+	private extractPromptParts(prompt: UserMessage): Array<
 		| { type: 'text'; text: string }
 		| { type: 'file'; mime: string; filename?: string; url: string }
 	> {
-		const msg = prompt as Record<string, unknown>;
-		const message = msg.message as Record<string, unknown> | undefined;
-		if (!message) return [{ type: 'text', text: '' }];
+		const parts: Array<
+			| { type: 'text'; text: string }
+			| { type: 'file'; mime: string; filename?: string; url: string }
+		> = [];
 
-		if (typeof message.content === 'string') {
-			return [{ type: 'text', text: message.content }];
+		for (const block of prompt.content) {
+			if (block.type === 'text') {
+				parts.push({ type: 'text', text: block.text });
+			} else if (block.type === 'image') {
+				parts.push({
+					type: 'file',
+					mime: block.mediaType,
+					url: `data:${block.mediaType};base64,${block.data}`,
+				});
+			} else if (block.type === 'document') {
+				parts.push({
+					type: 'file',
+					mime: block.mediaType,
+					filename: block.title || undefined,
+					url: `data:${block.mediaType};base64,${block.data}`,
+				});
+			}
 		}
 
-		if (Array.isArray(message.content)) {
-			const parts: Array<
-				| { type: 'text'; text: string }
-				| { type: 'file'; mime: string; filename?: string; url: string }
-			> = [];
-
-			for (const block of message.content as Array<Record<string, unknown>>) {
-				if (block.type === 'text') {
-					parts.push({ type: 'text', text: block.text as string });
-				} else if (block.type === 'image' && block.source) {
-					// Claude format: { type: 'image', source: { type: 'base64', media_type, data } }
-					const source = block.source as Record<string, unknown>;
-					if (source.type === 'base64' && source.data && source.media_type) {
-						parts.push({
-							type: 'file',
-							mime: source.media_type as string,
-							url: `data:${source.media_type};base64,${source.data}`,
-						});
-					}
-				} else if (block.type === 'document' && block.source) {
-					// Claude format: { type: 'document', source: { type: 'base64', media_type, data }, title }
-					const source = block.source as Record<string, unknown>;
-					if (source.type === 'base64' && source.data && source.media_type) {
-						parts.push({
-							type: 'file',
-							mime: source.media_type as string,
-							filename: (block.title as string) || undefined,
-							url: `data:${source.media_type};base64,${source.data}`,
-						});
-					}
-				}
-			}
-
-			if (parts.length === 0) {
-				parts.push({ type: 'text', text: '' });
-			}
-			return parts;
+		if (parts.length === 0) {
+			parts.push({ type: 'text', text: '' });
 		}
-
-		return [{ type: 'text', text: '' }];
+		return parts;
 	}
 
 	/**
@@ -1038,7 +1024,8 @@ export class OpenCodeEngine implements AIEngine {
 	async generateStructured<T = unknown>(options: StructuredGenerationOptions): Promise<T> {
 		const {
 			prompt,
-			model = 'claude-sonnet',
+			providerSlug,
+			modelId,
 			schema,
 			projectPath,
 			abortController
@@ -1059,24 +1046,20 @@ export class OpenCodeEngine implements AIEngine {
 			throw new Error('Failed to create OpenCode session');
 		}
 
-		// Parse model into providerID/modelID
-		const idx = model.indexOf('/');
-		const [providerID, modelID] = idx >= 0 ? [model.substring(0, idx), model.substring(idx + 1)] : ['', model];
-
 		// Wrap prompt with JSON instruction since v1 doesn't support format option
 		const jsonPrompt = `${prompt}
 
 IMPORTANT: You MUST respond with ONLY a valid JSON object matching this schema, no other text:
 ${JSON.stringify(schema, null, 2)}`;
 
-		debug.log('engine', `[OC structured] Sending prompt to session ${sessionId}, model=${model}`);
+		debug.log('engine', `[OC structured] Sending prompt to session ${sessionId}, provider=${providerSlug}, modelId=${modelId}`);
 
 		// Use v1 SDK synchronous prompt method — waits for completion
 		const response = await client.session.prompt({
 			path: { id: sessionId },
 			body: {
 				parts: [{ type: 'text', text: jsonPrompt }],
-				...(providerID && modelID ? { model: { providerID, modelID } } : {}),
+				...(providerSlug && modelId ? { model: { providerID: providerSlug, modelID: modelId } } : {}),
 				tools: {}
 			},
 			query: { directory: projectPath },

@@ -2,19 +2,33 @@
  * Claude Code Engine Adapter
  *
  * Wraps the @anthropic-ai/claude-agent-sdk into the AIEngine interface.
- * Messages are already in SDKMessage format — no conversion needed.
+ * SDK messages are converted to EngineOutput by ./message-converter.ts.
+ *
+ * Currently uses v1 query() API because v2 (unstable_v2_createSession) is
+ * @alpha and lacks critical options required by Clopen:
+ *   - cwd (multi-project working directory)
+ *   - mcpServers, systemPrompt, settingSources
+ *   - forkSession, maxTurns, abortController, includePartialMessages
+ *   - outputFormat (needed by generateStructured)
+ * When v2 SDKSessionOptions gains these, migrate streamQuery() to v2.
  */
 
-
-import { query, type SDKMessage, type EngineSDKMessage, type Options, type Query, type SDKUserMessage } from '$shared/types/messaging';
-import type { PermissionMode, PermissionResult } from "@anthropic-ai/claude-agent-sdk";
+import { query } from '@anthropic-ai/claude-agent-sdk';
+import type {
+	Options,
+	Query,
+	PermissionMode,
+	PermissionResult,
+} from '@anthropic-ai/claude-agent-sdk';
+import type { EngineOutput } from '$shared/types/unified';
 import type { StructuredGenerationOptions } from '../../types';
-import { normalizePath } from './path-utils';
+import { convertSdkMessage, toSdkUserMessage } from './message-converter';
+import { resolveOsPath } from '$backend/utils/paths';
 import { setupEnvironmentOnce, getEngineEnv } from './environment';
 import { handleStreamError } from './error-handler';
 import { getEnabledMcpServers, getAllowedMcpTools } from '../../../mcp';
 import type { AIEngine, EngineQueryOptions } from '../../types';
-import type { EngineModel } from '$shared/types/engine';
+import type { EngineModel } from '$shared/types/unified';
 import { CLAUDE_CODE_MODELS } from '$shared/constants/engines';
 
 import { debug } from '$shared/utils/logger';
@@ -24,11 +38,6 @@ interface PendingUserAnswer {
   resolve: (result: PermissionResult) => void;
   removeAbortListener: () => void;
   input: Record<string, unknown>;
-}
-
-/** Type guard for AsyncIterable */
-function isAsyncIterable<T>(value: unknown): value is AsyncIterable<T> {
-  return value != null && typeof value === 'object' && Symbol.asyncIterator in value;
 }
 
 export class ClaudeCodeEngine implements AIEngine {
@@ -67,18 +76,18 @@ export class ClaudeCodeEngine implements AIEngine {
   }
 
   /**
-   * Stream query with real-time callbacks
+   * Stream query, converting SDK messages → EngineOutput (unified types)
    */
-  async *streamQuery(options: EngineQueryOptions): AsyncGenerator<EngineSDKMessage, void, unknown> {
+  async *streamQuery(options: EngineQueryOptions): AsyncGenerator<EngineOutput, void, unknown> {
     const {
       projectPath,
       prompt,
       resume,
       maxTurns = undefined,
-      model = 'sonnet',
+      modelId,
       includePartialMessages = false,
       abortController,
-      claudeAccountId
+      accountId
     } = options;
 
     debug.log('chat', "Claude Code - Stream Query");
@@ -86,7 +95,7 @@ export class ClaudeCodeEngine implements AIEngine {
 
     this.activeController = abortController || new AbortController();
 
-    const normalizedProjectPath = normalizePath(projectPath);
+    const resolvedProjectPath = resolveOsPath(projectPath);
 
     try {
       // Get custom MCP servers and allowed tools
@@ -100,40 +109,40 @@ export class ClaudeCodeEngine implements AIEngine {
 
       // SDK uses cwd from options — no process.chdir() needed.
       // Environment is passed via env option — no process.env mutation.
-      // When claudeAccountId is specified, the env uses that account's token
-      // instead of the globally active account.
+      // When accountId is specified, the env overrides the OAuth token
+      // with that specific account's token instead of the globally active one.
       const sdkOptions: Options = {
         permissionMode: 'bypassPermissions' as PermissionMode,
         allowDangerouslySkipPermissions: true,
-        cwd: normalizedProjectPath,
-        env: getEngineEnv(claudeAccountId),
+        cwd: resolvedProjectPath,
+        env: getEngineEnv(accountId),
         systemPrompt: { type: "preset", preset: "claude_code" },
         settingSources: ["user", "project", "local"],
         forkSession: true,
         // Custom permission handler: blocks on AskUserQuestion until user answers,
         // auto-allows everything else. Works alongside bypassPermissions.
-        canUseTool: async (_toolName, input, options) => {
+        canUseTool: async (_toolName, input, canUseToolOptions) => {
           if (_toolName === 'AskUserQuestion') {
-            debug.log('engine', `AskUserQuestion detected (toolUseID: ${options.toolUseID}), waiting for user input...`);
+            debug.log('engine', `AskUserQuestion detected (toolUseID: ${canUseToolOptions.toolUseID}), waiting for user input...`);
             return new Promise<PermissionResult>((resolve) => {
               // Handle abort (stream cancelled while waiting)
-              if (options.signal.aborted) {
+              if (canUseToolOptions.signal.aborted) {
                 resolve({ behavior: 'deny', message: 'Cancelled' });
                 return;
               }
               const onAbort = () => {
-                this.pendingUserAnswers.delete(options.toolUseID);
+                this.pendingUserAnswers.delete(canUseToolOptions.toolUseID);
                 resolve({ behavior: 'deny', message: 'Cancelled' });
               };
-              options.signal.addEventListener('abort', onAbort, { once: true });
+              canUseToolOptions.signal.addEventListener('abort', onAbort, { once: true });
 
-              this.pendingUserAnswers.set(options.toolUseID, {
+              this.pendingUserAnswers.set(canUseToolOptions.toolUseID, {
                 resolve: (result: PermissionResult) => {
-                  options.signal.removeEventListener('abort', onAbort);
+                  canUseToolOptions.signal.removeEventListener('abort', onAbort);
                   resolve(result);
                 },
                 removeAbortListener: () => {
-                  options.signal.removeEventListener('abort', onAbort);
+                  canUseToolOptions.signal.removeEventListener('abort', onAbort);
                 },
                 input
               });
@@ -142,7 +151,7 @@ export class ClaudeCodeEngine implements AIEngine {
           // Auto-allow all other tools
           return { behavior: 'allow' as const, updatedInput: input };
         },
-        ...(model && { model }),
+        ...(modelId && { model: modelId }),
         ...(resume && { resume }),
         ...(maxTurns && { maxTurns }),
         ...(includePartialMessages && { includePartialMessages }),
@@ -151,16 +160,11 @@ export class ClaudeCodeEngine implements AIEngine {
         ...(allowedMcpTools.length > 0 && { allowedTools: allowedMcpTools })
       };
 
-      // Create async iterable from single message if needed
-      let promptIterable: AsyncIterable<SDKUserMessage>;
-
-      if (isAsyncIterable<SDKUserMessage>(prompt)) {
-        promptIterable = prompt;
-      } else {
-        promptIterable = (async function* () {
-          yield prompt as SDKUserMessage;
-        })();
-      }
+      // Convert UserMessage → SDKUserMessage for SDK
+      const sdkPrompt = toSdkUserMessage(prompt);
+      const promptIterable = (async function* () {
+        yield sdkPrompt;
+      })();
 
       const queryInstance = query({
         prompt: promptIterable,
@@ -169,8 +173,9 @@ export class ClaudeCodeEngine implements AIEngine {
 
       this.activeQuery = queryInstance;
 
-      for await (const message of queryInstance) {
-        yield message;
+      for await (const sdkMessage of queryInstance) {
+        // Convert SDK message → EngineOutput (may yield 0-N events per SDK message)
+        yield* convertSdkMessage(sdkMessage);
       }
 
     } catch (error) {
@@ -267,11 +272,11 @@ export class ClaudeCodeEngine implements AIEngine {
   async generateStructured<T = unknown>(options: StructuredGenerationOptions): Promise<T> {
     const {
       prompt,
-      model = 'haiku',
+      modelId,
       schema,
       projectPath,
       abortController,
-      claudeAccountId
+      accountId
     } = options;
 
     if (!this._isInitialized) {
@@ -279,7 +284,7 @@ export class ClaudeCodeEngine implements AIEngine {
     }
 
     const controller = abortController || new AbortController();
-    const normalizedPath = normalizePath(projectPath);
+    const resolvedPath = resolveOsPath(projectPath);
 
     // Optimized for one-shot structured generation:
     // - tools: [] prevents tool use (no agentic loops)
@@ -291,8 +296,8 @@ export class ClaudeCodeEngine implements AIEngine {
     const sdkOptions: Options = {
       permissionMode: 'bypassPermissions' as PermissionMode,
       allowDangerouslySkipPermissions: true,
-      cwd: normalizedPath,
-      env: getEngineEnv(claudeAccountId),
+      cwd: resolvedPath,
+      env: getEngineEnv(accountId),
       systemPrompt: 'You are a structured data generator. Return JSON matching the provided schema.',
       tools: [],
       outputFormat: {
@@ -302,7 +307,7 @@ export class ClaudeCodeEngine implements AIEngine {
       persistSession: false,
       effort: 'low',
       thinking: { type: 'disabled' },
-      ...(model && { model }),
+      ...(modelId && { model: modelId }),
       abortController: controller
     };
 

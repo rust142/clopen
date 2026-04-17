@@ -10,7 +10,7 @@
 
 <script lang="ts">
 	import { tick } from 'svelte';
-	import type { SDKMessageFormatter } from '$shared/types/database/schema';
+	import type { FrontendMessage } from '$frontend/stores/core/sessions.svelte';
 	import type { IconName } from '$shared/types/ui/icons';
 	import Card from '$frontend/components/common/display/Card.svelte';
 	import MessageFormatter from '../formatters/MessageFormatter.svelte';
@@ -30,7 +30,7 @@
 		onEdit,
 		onShowDebug
 	}: {
-		message: SDKMessageFormatter;
+		message: FrontendMessage;
 		messageTimestamp: string;
 		isLastUserMessage?: boolean;
 		roleConfig: { gradient: string; icon: IconName; name: string };
@@ -50,9 +50,9 @@
 	$effect(() => {
 		if (roleCategory !== 'reasoning' && roleCategory !== 'system' && roleCategory !== 'compact') return;
 		if (!scrollContainer) return;
-		// Track message content changes (partialText for streaming, message for final)
-		const _track = message.type === 'stream_event' && 'partialText' in message
-			? message.partialText
+		// Track message content changes (text for streaming, message for final)
+		const _track = message.type === 'stream_event'
+			? message.text
 			: message;
 		tick().then(() => {
 			if (scrollContainer) {
@@ -62,16 +62,13 @@
 	});
 
 	// Force reactive tracking for assistant text streaming.
-	// Without an explicit $effect that reads partialText, Svelte 5's derived chain
-	// may not re-render the component when partialText changes on a proxied object.
+	// Without an explicit $effect that reads text, Svelte 5's derived chain
+	// may not re-render the component when text changes on a proxied object.
 	// Reasoning gets this implicitly via the auto-scroll effect above.
 	$effect(() => {
 		if (roleCategory !== 'assistant') return;
 		if (message.type !== 'stream_event') return;
-		if (!('partialText' in message)) return;
-		// Reading partialText subscribes this effect to changes,
-		// which forces the component to re-evaluate its derived values
-		const _track = message.partialText;
+		const _track = message.text;
 	});
 </script>
 

@@ -2,14 +2,14 @@
  * Engine Types (Backend)
  *
  * Defines the AIEngine interface that all engine adapters must implement.
- * Every adapter normalizes its output to Claude SDK format (SDKMessage)
+ * Every adapter converts SDK-specific events to EngineOutput (unified format)
  * so stream-manager and frontend remain engine-agnostic.
  */
 
-import type { SDKMessage, SDKUserMessage, EngineSDKMessage } from '$shared/types/messaging';
-import type { EngineType, EngineModel } from '$shared/types/engine';
+import type { EngineType, UserMessage, EngineOutput } from '$shared/types/unified';
+import type { EngineModel } from '$shared/types/unified';
 
-export type { EngineType, EngineModel };
+export type { EngineType };
 
 /** Execution context for MCP tool handlers (project isolation) */
 export interface McpExecutionContext {
@@ -21,14 +21,17 @@ export interface McpExecutionContext {
 /** Options passed to engine.streamQuery() */
 export interface EngineQueryOptions {
 	projectPath: string;
-	prompt: SDKUserMessage;
+	prompt: UserMessage;
 	resume?: string;
 	forkSession?: boolean;
 	maxTurns?: number;
-	model?: string;
+	/** Provider slug (e.g. 'anthropic', 'openai'). Required for OpenCode. */
+	providerSlug: string;
+	/** Model ID (e.g. 'claude-opus-4-6', 'gpt-5'). */
+	modelId: string;
 	includePartialMessages?: boolean;
 	abortController?: AbortController;
-	claudeAccountId?: number;
+	accountId?: number;
 	/** Context bound to MCP tool handlers for project isolation */
 	mcpContext?: McpExecutionContext;
 }
@@ -36,11 +39,14 @@ export interface EngineQueryOptions {
 /** Options for one-shot structured generation (no tools, no streaming) */
 export interface StructuredGenerationOptions {
 	prompt: string;
-	model?: string;
+	/** Provider slug (e.g. 'anthropic', 'openai'). Required for OpenCode. */
+	providerSlug: string;
+	/** Model ID. */
+	modelId: string;
 	schema: Record<string, unknown>;
 	projectPath: string;
 	abortController?: AbortController;
-	claudeAccountId?: number;
+	accountId?: number;
 }
 
 /** The contract every engine adapter must fulfil */
@@ -59,9 +65,9 @@ export interface AIEngine {
 
 	/**
 	 * Stream a query.
-	 * MUST yield messages in Claude SDK format (SDKMessage).
+	 * MUST yield events in EngineOutput format (unified types).
 	 */
-	streamQuery(options: EngineQueryOptions): AsyncGenerator<EngineSDKMessage, void, unknown>;
+	streamQuery(options: EngineQueryOptions): AsyncGenerator<EngineOutput, void, unknown>;
 
 	/** Cancel the active query */
 	cancel(): Promise<void>;

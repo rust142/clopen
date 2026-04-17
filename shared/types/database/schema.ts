@@ -1,11 +1,8 @@
 /**
  * Database-specific types
- *
- * Uses official @anthropic-ai/claude-agent-sdk types for consistency
  */
 
-import type { SDKMessage, EngineSDKMessage } from '../messaging';
-import type { EngineType } from '../engine';
+import type { EngineType } from '../unified';
 
 // Core database entities moved from core folder
 export interface Project {
@@ -17,16 +14,33 @@ export interface Project {
 }
 
 export interface ChatSession {
+	// ── Identity ──
 	id: string;
 	project_id: string;
-	title?: string;
-	engine?: EngineType; // AI engine used for this session
-	model?: string; // Compound model ID (e.g., 'claude-code:haiku', 'opencode:gpt-5.2')
-	claude_account_id?: number; // Per-session Claude account override (references claude_accounts.id)
-	latest_sdk_session_id?: string; // Latest SDK session_id from responses
-	current_head_message_id?: string; // Git-like HEAD pointer to current branch tip
 	started_at: string;
 	ended_at?: string;
+
+	// ── Session preferences (user-selected, persist across HEAD changes) ──
+	title?: string; // Conversation title — auto-set from first user message, editable
+	engine?: EngineType; // AI engine used for this session
+	provider?: string; // Provider slug (e.g., 'anthropic', 'openai', 'opencode')
+	model_id?: string; // Model identifier (e.g., 'sonnet', 'gpt-5.2')
+	model_name?: string; // Display name (e.g., 'Sonnet 4.6', 'GPT-5.2')
+	account_id?: number; // Engine account used for this session
+	account_name?: string; // Display name of the selected account
+
+	// ── HEAD state (re-derived when HEAD changes: undo/redo/restore/branch) ──
+	head_message_id?: string; // Git-like HEAD pointer to current branch tip
+	head_session_id?: string; // Engine-issued session ID for resume (aligns with MessageBase.sessionId)
+	head_title?: string; // Last user message text at HEAD (truncated)
+	head_summary?: string; // Last assistant response text at HEAD (truncated)
+
+	// ── Activity tracking (updated on each message) ──
+	sender_id?: string; // Last active user
+	sender_name?: string;
+	message_count?: number; // Total messages (all types)
+	user_count?: number; // User messages only
+	last_message_at?: string; // Timestamp of the latest message
 }
 
 export interface Settings {
@@ -37,41 +51,26 @@ export interface Settings {
 
 
 /**
- * Database Message interface
- * Stores official SDKMessage as JSON with additional metadata
+ * Database Message interface.
+ *
+ * `data` (JSON blob of UnifiedMessage) is the **single source of truth**.
+ * The other columns are **indexed projections** of fields inside the JSON,
+ * kept in sync at write-time for SQL performance (WHERE, ORDER BY, graph traversal).
  */
 export interface DatabaseMessage {
+	/** Primary key — projection of data.messageId */
 	id: string;
+	/** Projection of data.sessionId — used in WHERE filters */
 	session_id: string;
-	timestamp: string;
-	// Store the complete SDKMessage as JSON for full fidelity
-	sdk_message: string; // JSON string of SDKMessage
-	// User identification for shared chat
-	sender_id?: string | null;
-	sender_name?: string | null;
-	// Git-like commit graph support
-	parent_message_id?: string | null; // Parent message (like git parent commit)
-	// Soft delete and branch support for undo/redo (deprecated, kept for backward compatibility)
-	is_deleted?: number; // 0 = active, 1 = soft deleted
-	branch_id?: string | null; // Branch identifier (now used as branch name)
+	/** Projection of data.createdAt — used in ORDER BY and range queries */
+	created_at: string;
+	/** Serialized UnifiedMessage JSON — the canonical source of truth */
+	data: string;
+	/** Projection of data.parent.messageId — used in graph traversal (getPathToRoot, getChildren) */
+	parent_message_id?: string | null;
+	is_deleted?: number;
+	branch_id?: string | null;
 }
-
-/**
- * SDK Message with database timestamp and user info for UI display
- */
-export type SDKMessageFormatter = EngineSDKMessage & {
-	partialText?: string; // Accumulated partial text for streaming messages (transient, not persisted)
-	metadata?: { // System-added info (not part of official SDK response)
-		message_id?: string; // Database message ID
-		created_at?: string; // Message creation timestamp
-		sender_id?: string | null; // User ID who submitted the chat (user messages only)
-		sender_name?: string | null; // Display name of who submitted the chat (user messages only)
-		parent_message_id?: string | null; // Git-like parent pointer
-		engine?: string; // Engine type that produced this message (claude-code, opencode)
-		reasoning?: boolean; // Whether this message is a reasoning/thinking message
-		interrupted?: boolean; // Whether the stream ended before all tools got results
-	};
-};
 
 /**
  * Database-specific Setting interface

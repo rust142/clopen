@@ -10,16 +10,7 @@
 import { t } from 'elysia';
 import { createRouter } from '$shared/utils/ws-server';
 import { messageQueries } from '../../database/queries';
-import { formatDatabaseMessage } from '$shared/utils/message-formatter';
-
-function extractTextContent(content: unknown): string {
-	if (typeof content === 'string') return content;
-	if (!Array.isArray(content)) return '';
-	return content
-		.filter((c: any) => c.type === 'text')
-		.map((b: any) => b.text || '')
-		.join(' ');
-}
+import { loadMessage } from '$shared/utils/message-formatter';
 
 export const crudHandler = createRouter()
 	// List messages
@@ -33,56 +24,11 @@ export const crudHandler = createRouter()
 		if (data.include_all) {
 			// Return all messages including those in other branches (for History view)
 			const allMessages = messageQueries.getAllBySessionId(data.session_id);
-			const messages = allMessages.map(msg => formatDatabaseMessage(msg));
-			return messages;
+			return allMessages.map(msg => loadMessage(msg));
 		} else {
 			// Default: return only messages in current HEAD path (for Chat view)
-			const messages = messageQueries.getBySessionId(data.session_id);
-			return messages;
+			return messageQueries.getBySessionId(data.session_id);
 		}
-	})
-
-	// Bulk session preview — returns title, summary, and message counts for multiple sessions
-	// without loading all messages. Used by the Sessions/History modal.
-	.http('sessions:preview', {
-		data: t.Object({
-			session_ids: t.Array(t.String())
-		}),
-		response: t.Array(t.Any())
-	}, ({ data }) => {
-		return data.session_ids.map(sessionId => {
-			const preview = messageQueries.getSessionPreview(sessionId);
-
-			// Title from first user message
-			let title = 'New Conversation';
-			if (preview.firstUserMessage) {
-				const sdk = JSON.parse(preview.firstUserMessage.sdk_message);
-				const textContent = extractTextContent(sdk.message?.content).trim();
-				if (textContent) {
-					title = textContent.slice(0, 60) + (textContent.length > 60 ? '...' : '');
-				}
-			}
-
-			// Summary from last assistant message
-			let summary = 'No messages yet';
-			if (preview.lastAssistantMessage) {
-				const sdk = JSON.parse(preview.lastAssistantMessage.sdk_message);
-				const rawText = extractTextContent(sdk.message?.content);
-				const cleanText = rawText.replace(/```[\s\S]*?```/g, '').trim();
-				if (cleanText) {
-					summary = cleanText.slice(0, 100) + (cleanText.length > 100 ? '...' : '');
-				}
-			}
-
-			return {
-				session_id: sessionId,
-				title,
-				summary,
-				userCount: preview.userCount,
-				assistantCount: preview.assistantCount,
-				count: preview.userCount + preview.assistantCount
-			};
-		});
 	})
 
 	// Get message by ID
@@ -98,8 +44,7 @@ export const crudHandler = createRouter()
 			throw new Error('Message not found');
 		}
 
-		// Parse SDK message and return with database metadata
-		return formatDatabaseMessage(message);
+		return loadMessage(message);
 	})
 
 	// Delete message
