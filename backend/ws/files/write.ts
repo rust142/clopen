@@ -23,6 +23,9 @@ import {
 	uploadFileOperation,
 	deleteOperation
 } from '../../files/file-operations';
+import { join } from 'node:path';
+import { stat as fsStat, readdir as fsReaddir, rename as fsRename, access as fsAccess } from 'node:fs/promises';
+import { requireFilePathAccess, requireSharedFilePathAccess } from './path-access';
 
 export const writeHandler = createRouter()
 	// Write file operation
@@ -36,12 +39,13 @@ export const writeHandler = createRouter()
 			size: t.Number(),
 			modified: t.String()
 		})
-	}, async ({ data }) => {
+	}, async ({ data, conn }) => {
+		const filePath = requireFilePathAccess(conn, data.filePath);
 		debug.log('file', 'Write file operation:', {
-			filePath: data.filePath,
+			filePath,
 			contentLength: data.content.length
 		});
-		return await writeFileOperation(data.filePath, data.content);
+		return await writeFileOperation(filePath, data.content);
 	})
 
 	// Create file operation
@@ -56,8 +60,9 @@ export const writeHandler = createRouter()
 			size: t.Number(),
 			modified: t.String()
 		})
-	}, async ({ data }) => {
-		return await createFileOperation(data.filePath, data.content);
+	}, async ({ data, conn }) => {
+		const filePath = requireFilePathAccess(conn, data.filePath);
+		return await createFileOperation(filePath, data.content);
 	})
 
 	// Create directory operation
@@ -70,8 +75,12 @@ export const writeHandler = createRouter()
 			path: t.String(),
 			modified: t.String()
 		})
-	}, async ({ data }) => {
-		return await createDirectoryOperation(data.dirPath);
+	}, async ({ data, conn }) => {
+		// Uses the shared guard so FolderBrowser can create candidate project
+		// folders outside any existing project, while still preventing writes
+		// inside another user's project.
+		const dirPath = requireSharedFilePathAccess(conn, data.dirPath);
+		return await createDirectoryOperation(dirPath);
 	})
 
 	// Rename operation
@@ -86,8 +95,10 @@ export const writeHandler = createRouter()
 			newPath: t.String(),
 			modified: t.String()
 		})
-	}, async ({ data }) => {
-		return await renameOperation(data.oldPath, data.newPath);
+	}, async ({ data, conn }) => {
+		const oldPath = requireFilePathAccess(conn, data.oldPath);
+		const newPath = requireFilePathAccess(conn, data.newPath);
+		return await renameOperation(oldPath, newPath);
 	})
 
 	// Duplicate operation
@@ -103,8 +114,10 @@ export const writeHandler = createRouter()
 			size: t.Number(),
 			modified: t.String()
 		})
-	}, async ({ data }) => {
-		return await duplicateOperation(data.sourcePath, data.targetPath);
+	}, async ({ data, conn }) => {
+		const sourcePath = requireFilePathAccess(conn, data.sourcePath);
+		const targetPath = requireFilePathAccess(conn, data.targetPath);
+		return await duplicateOperation(sourcePath, targetPath);
 	})
 
 	// Upload file operation
@@ -124,8 +137,10 @@ export const writeHandler = createRouter()
 			size: t.Number(),
 			modified: t.String()
 		})
-	}, async ({ data }) => {
-		return await uploadFileOperation(data.file, data.targetPath);
+	}, async ({ data, conn }) => {
+		const targetPath = requireFilePathAccess(conn, data.targetPath);
+		requireFilePathAccess(conn, join(targetPath, data.file.name));
+		return await uploadFileOperation(data.file, targetPath);
 	})
 
 	// Delete operation
@@ -138,6 +153,85 @@ export const writeHandler = createRouter()
 			message: t.String(),
 			path: t.String()
 		})
-	}, async ({ data }) => {
-		return await deleteOperation(data.filePath, data.force);
+	}, async ({ data, conn }) => {
+		const filePath = requireFilePathAccess(conn, data.filePath);
+		return await deleteOperation(filePath, data.force);
+	})
+
+	// Delete an empty directory from FolderBrowser. Restricted to:
+	// - real directory (not a file)
+	// - empty contents (no force, no recursive)
+	// - shared guard (outside all projects, or inside the user's own project)
+	.http('files:delete-directory', {
+		data: t.Object({
+			dirPath: t.String()
+		}),
+		response: t.Object({
+			message: t.String(),
+			path: t.String()
+		})
+	}, async ({ data, conn }) => {
+		const dirPath = requireSharedFilePathAccess(conn, data.dirPath);
+
+		const stats = await fsStat(dirPath);
+		if (!stats.isDirectory()) {
+			throw new Error('Path is not a directory');
+		}
+		const entries = await fsReaddir(dirPath);
+		if (entries.length > 0) {
+			throw new Error('Directory is not empty');
+		}
+
+		return await deleteOperation(dirPath, false);
+	})
+
+	// Rename a directory from FolderBrowser (e.g. fix typo on a candidate
+	// project folder). Restricted to real directories on both sides and
+	// guarded by the shared path access policy. Uses fs.rename directly
+	// because Bun.file(...).exists() returns false for directories, which
+	// makes the generic renameOperation unusable here.
+	.http('files:rename-directory', {
+		data: t.Object({
+			oldPath: t.String(),
+			newPath: t.String()
+		}),
+		response: t.Object({
+			message: t.String(),
+			oldPath: t.String(),
+			newPath: t.String(),
+			modified: t.String()
+		})
+	}, async ({ data, conn }) => {
+		const oldPath = requireSharedFilePathAccess(conn, data.oldPath);
+		const newPath = requireSharedFilePathAccess(conn, data.newPath);
+
+		let oldStats;
+		try {
+			oldStats = await fsStat(oldPath);
+		} catch {
+			throw new Error('Source path does not exist');
+		}
+		if (!oldStats.isDirectory()) {
+			throw new Error('Source path is not a directory');
+		}
+
+		try {
+			await fsAccess(newPath);
+			throw new Error('Destination path already exists');
+		} catch (err) {
+			if (err instanceof Error && err.message === 'Destination path already exists') {
+				throw err;
+			}
+			// fsAccess threw because newPath does not exist — that is what we want.
+		}
+
+		await fsRename(oldPath, newPath);
+		const newStats = await fsStat(newPath);
+
+		return {
+			message: 'Directory renamed successfully',
+			oldPath,
+			newPath,
+			modified: newStats.mtime.toISOString()
+		};
 	});
