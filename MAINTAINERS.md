@@ -14,11 +14,14 @@ Internal guide for Clopen core maintainers. External contributors should follow 
   - [3. Choose a Review Path](#3-choose-a-review-path)
   - [4. Merge](#4-merge)
 - [Review Paths](#review-paths)
-  - [Path A — Iterate on the Branch](#path-a--iterate-on-the-branch)
-  - [Path B — Comment and Wait](#path-b--comment-and-wait)
-  - [Path C — Close and Replace](#path-c--close-and-replace)
+  - [Path A — Approve and Merge](#path-a--approve-and-merge)
+  - [Path B — Iterate on the Branch](#path-b--iterate-on-the-branch)
+  - [Path C — Merge As-Is, Follow-up PR](#path-c--merge-as-is-follow-up-pr)
+  - [Path D — Comment and Wait](#path-d--comment-and-wait)
+  - [Path E — Close and Replace](#path-e--close-and-replace)
 - [Security PRs](#security-prs)
 - [Communication Norms](#communication-norms)
+  - [Suggest by Default; Act on Confirmation](#suggest-by-default-act-on-confirmation)
 - [Operational Policy](#operational-policy)
   - [Force-Push](#force-push)
   - [Conflict Resolution Between Maintainers](#conflict-resolution-between-maintainers)
@@ -55,7 +58,7 @@ These principles inform every decision in this guide. Cite them in a PR comment 
 
 ## The PR Lifecycle
 
-This is the standard flow for a fork-originated PR. Each step links to its full procedure.
+This is the standard flow for a fork-originated PR.
 
 ### 1. Intake
 
@@ -75,10 +78,11 @@ Read the full diff before forming a position. Do not skim, do not draft comments
 
 ### 2. Audit
 
-After reading the diff, evaluate two things **before** asking the contributor to validate or iterate:
+After reading the diff, evaluate three things **before** asking the contributor to validate or iterate:
 
 1. **Adjacent code** — search the codebase for similar gaps the PR didn't address. Bugs of the same shape usually cluster; if one site needed fixing, others likely do too. This matters most for security and refactor PRs.
 2. **Adjacent patterns** — does the PR introduce a new mechanism where an established pattern in the codebase already covers this class of problem? Default to the established pattern unless the contributor can articulate why it doesn't fit.
+3. **Test coverage** — does the change include `*.test.ts` where [CONTRIBUTING.md → Tests](./CONTRIBUTING.md#tests) expects them? If a test is missing, decide whether you add it on the branch ([Path B](#path-b--iterate-on-the-branch)) or request it from the contributor ([Path D](#path-d--comment-and-wait)). Security PRs without a regression test are not merge-ready.
 
 The audit is what determines the review path. Skipping it and going straight to "looks good, please test" is the most common cause of churn.
 
@@ -86,20 +90,20 @@ The audit is what determines the review path. Skipping it and going straight to 
 
 | Situation | Path |
 |-----------|------|
-| Audit is clean — no adjacent gaps, established patterns followed, scope appropriate | Approve and proceed to [Merge](#4-merge) |
-| Same shape, small additions / fixes needed, contributor is engaged | [Path A — Iterate on the Branch](#path-a--iterate-on-the-branch) |
-| Out-of-scope items found in the audit | File a separate PR after this one merges |
-| Concerns are substantive but you may be missing context, **or** part of the PR is mergeable while another part needs discussion | [Path B — Comment and Wait](#path-b--comment-and-wait) |
-| Structural approach needs to change, or you'd be rewriting most of the diff yourself | [Path C — Close and Replace](#path-c--close-and-replace) |
+| Audit is clean — no adjacent gaps, established patterns followed, scope appropriate | [Path A — Approve and Merge](#path-a--approve-and-merge) |
+| Same shape, small additions / fixes needed, contributor is engaged | [Path B — Iterate on the Branch](#path-b--iterate-on-the-branch) |
+| Out-of-scope items found in the audit | [Path C — Merge As-Is, Follow-up PR](#path-c--merge-as-is-follow-up-pr) |
+| Concerns are substantive but you may be missing context, **or** part of the PR is mergeable while another part needs discussion | [Path D — Comment and Wait](#path-d--comment-and-wait) |
+| Structural approach needs to change, or you'd be rewriting most of the diff yourself | [Path E — Close and Replace](#path-e--close-and-replace) |
 
-The happy path (direct merge) is the goal — Paths A through C exist for when the audit surfaces something that warrants intervention. If you're unsure whether intervention is needed but lean toward "something feels off", default to Path B — it preserves optionality without committing to a direction.
+The happy path ([Path A](#path-a--approve-and-merge)) is the goal — the other paths exist for when the audit surfaces something that warrants intervention. If you're unsure whether intervention is needed but lean toward "something feels off", default to [Path D](#path-d--comment-and-wait) — it preserves optionality without committing to a direction.
 
 ### 4. Merge
 
 When the PR is ready:
 
 - **Strategy:** Always squash-merge via the GitHub UI.
-- **Subject:** Use GitHub's default (`<PR title> (#NNN)`). The PR title must already follow the conventional commit format from [CONTRIBUTING.md](./CONTRIBUTING.md).
+- **Subject:** Use GitHub's default (`<PR title> (#NNN)`). The PR title must already follow the conventional commit format from [CONTRIBUTING.md → Commit Messages](./CONTRIBUTING.md#commit-messages).
 - **Extended description:** Leave empty. Repo convention is subject-only — check recently-merged PRs on `main` if unsure of the current style. Detail belongs in the PR description, not duplicated into the commit body. **Exception:** `Co-authored-by:` trailer when the PR is a reshape of a contributor's earlier work — see [`Co-authored-by` Trailer Format](#co-authored-by-trailer-format).
 - **Branch deletion:** Delete the source branch via the GitHub button immediately after merge.
 
@@ -115,7 +119,23 @@ git branch -D <merged-branch>
 
 ## Review Paths
 
-### Path A — Iterate on the Branch
+Five paths, one per row of [Choose a Review Path](#3-choose-a-review-path). Each subsection is self-contained: when to use it, the procedure (if any git ops), and a worked example comment.
+
+Worked examples use these placeholders: `@contributor`, `#NNN`, `path/to/file.ts:LL`, dates in `YYYY-MM-DD`. All comments are posted via the GitHub PR UI per [Communication Norms](#communication-norms).
+
+### Path A — Approve and Merge
+
+Use when the audit is clean — no adjacent gaps, established patterns followed, scope appropriate, and tests are present where [CONTRIBUTING.md → Tests](./CONTRIBUTING.md#tests) requires them. Post a short approval comment, then proceed to [Merge](#4-merge).
+
+```markdown
+Audit clean — checked adjacent call sites in `path/to/dir`, no similar gaps. Follows the existing `<pattern>` pattern (see `path/to/reference.ts:LL`). `bun run check` / `bun run lint` / `bun test` all green locally. Merging.
+
+Thanks @contributor!
+```
+
+For security-sensitive PRs, also note that the threat model in the description matches the diff (or summarize it yourself if the contributor didn't include one).
+
+### Path B — Iterate on the Branch
 
 Use when the PR's shape is right and only needs additions or small fixes. Requires `maintainerCanModify: true` (default for fork PRs unless the contributor opted out).
 
@@ -144,65 +164,88 @@ Use `merge` (not `rebase`) when syncing with `main` to preserve the contributor'
 
 #### Post-push comment
 
-Post a comment via the **GitHub PR UI** describing what changed (see [Communication Norms](#communication-norms) for why the UI, not the CLI). Suggested format:
+After the push, comment using the same `## Summary / ## Why / ## Changes / ## Notes` structure as [CONTRIBUTING.md → Pull Request Format](./CONTRIBUTING.md#pull-request-format). Optional headers (`## Security impact`, `## Test plan`) apply when relevant.
 
 ```markdown
 Hi @contributor, thanks for this contribution. I built on top of your commit with a few additional fixes — everything is pushed to this branch.
 
 ## Summary
-…
+Covers the two adjacent call sites the original commit didn't reach (`path/to/a.ts:LL`, `path/to/b.ts:LL`), plus a regression test for the boundary case.
 
 ## Why
-…
+Same DoS shape as the original target reached those endpoints too — see audit notes below. Wanted to land all three together so the protection is uniform.
 
 ## Changes
-- …
+- `path/to/a.ts:LL` — apply `validateFoo` before write.
+- `path/to/b.ts:LL` — same, with comment on why post-expansion length is the right thing to check.
+- `path/to/foo.test.ts` — added boundary cases for the two new sites.
 
 ## Notes
-- `bun run check` and `bun run lint` both pass clean.
-- N files changed, +X/-Y.
+- `bun run check`, `bun run lint`, `bun test` all pass clean.
+- 3 files changed, +X/-Y on top of your commit.
 - Branch synced with latest `main`.
 ```
 
-The same optional headers from [CONTRIBUTING.md → Pull Request Format](./CONTRIBUTING.md#pull-request-format) apply (`## Security impact`, `## Test plan`, etc.).
+### Path C — Merge As-Is, Follow-up PR
 
-### Path B — Comment and Wait
+Use when the audit surfaces issues that share a shape with this PR but live in different files/areas the contributor didn't sign up for. Don't expand the scope of the open PR — credit the find, merge what's ready, file the follow-up separately.
 
-Use when concerns are substantive but the contributor may have context or reasoning you're missing — or when part of the PR is clearly mergeable while another part needs discussion. This path sits between Path A (you're confident, just iterate) and Path C (you're confident, just replace).
+```markdown
+Audit clean for the in-scope changes — merging.
 
-**Defining trait:** you'd update your position if the contributor brought a stronger argument. If you can't articulate what would change your mind, you've already decided — use Path A or C.
+While auditing I noticed two adjacent call sites with the same shape (`path/to/x.ts:LL`, `path/to/y.ts:LL`) that should get the same treatment, but they're outside what this PR signed up for. Filing a follow-up PR (`fix/<scope>-cover-adjacent-sites`, per [CONTRIBUTING.md → Branch Naming](./CONTRIBUTING.md#branch-naming)) crediting this one for surfacing the pattern.
 
-#### Writing the comment
+Thanks @contributor!
+```
 
-Post via the **GitHub PR UI**. Structure:
+In the follow-up PR description, link back under `## Related` so the trail is legible from both sides.
+
+### Path D — Comment and Wait
+
+Use when concerns are substantive but the contributor may have context or reasoning you're missing — or when part of the PR is clearly mergeable while another part needs discussion. This path sits between [Path B](#path-b--iterate-on-the-branch) (you're confident, just iterate) and [Path E](#path-e--close-and-replace) (you're confident, just replace).
+
+**Defining trait:** you'd update your position if the contributor brought a stronger argument. If you can't articulate what would change your mind, you've already decided — use [Path B](#path-b--iterate-on-the-branch) or [Path E](#path-e--close-and-replace).
+
+#### Comment structure
 
 1. **Acknowledge the work** in one line. The contributor put real time in; lead with that.
-2. **Approve the parts that are clearly right** with concrete next steps (e.g. *"please open a separate PR covering these additional N sites"*). The merge path should be visible to the contributor by the time they finish reading.
-3. **State concerns about the rest** with file/line references — auditable, not opinion. Frame as concerns: *"I have some concerns"*, *"I might be missing something"*, *"would value your reasoning"*. Use definite framing only where you're certain.
-4. **Invite the counterargument explicitly.** Name the question that would change your mind: *"if you have a concrete scenario where X applies here, I'd like to hear it."* This is what distinguishes Path B from a soft close.
+2. **Approve the parts that are clearly right** with concrete next steps. The merge path should be visible to the contributor by the time they finish reading.
+3. **State concerns about the rest** with file/line references — auditable, not opinion. Frame as concerns ("I have some concerns", "would value your reasoning"); use definite framing only where you're certain.
+4. **Invite the counterargument explicitly.** Name the question that would change your mind — this is what distinguishes Path D from a soft close.
 5. **State the next step and a deadline.** Without a deadline the PR stalls; with one, silence becomes a decision.
+
+```markdown
+Hi @contributor, thanks for surfacing this — the validator module shape is the right call.
+
+I want to merge this, but the audit turned up two things I'd like your read on first:
+
+1. **`path/to/file.ts:LL` validates `payload.size`, but the bytes actually written are `payload.data`.** A mismatched payload (e.g. `{ size: 1, data: <60MB Uint8Array> }`) appears to bypass the limit. Is there a reason to trust the size field here? If you have a concrete threat model where this isn't reachable, I'd value the reasoning — otherwise we should validate `payload.data.byteLength`.
+
+2. **`path/to/other.ts:LL` (`<adjacent endpoint>`) takes the same content shape and isn't covered.** Could fold into this PR or split into its own — your call. If you bundle, please also add a regression test for the boundary case (50MB exactly + 50MB + 1 byte).
+
+The merge path is clear once we agree on (1). Please share your thoughts by YYYY-MM-DD. If we don't hear back by then I'll close this PR as auto-stale — you're welcome to reopen or resubmit whenever it's convenient.
+```
 
 #### Deadlines and auto-stale
 
 - **Default response window:** 1 week from the comment date. Adjust up for holiday periods or complex PRs, down for trivial clarifications.
-- **Phrasing template:** *"Please share your thoughts by YYYY-MM-DD. If we don't hear back by then I'll close this PR as auto-stale — you're welcome to reopen or resubmit whenever it's convenient."*
-- **After the deadline,** close the PR via the GitHub UI with a brief, polite note referring back to the previous comment. The contributor can reopen at any time.
+- **After the deadline,** close the PR with a brief, polite note referring back to the previous comment. The contributor can reopen at any time.
 
 GitHub has no native auto-close — track these manually (calendar reminder, scheduled task, or a weekly maintainer sweep over open PRs with stale comments).
 
 #### If the contributor responds with a stronger argument
 
-Update your position openly. The point of Path B is to actually be persuadable — if a credible counterargument arrives, acknowledge it and adjust (merge as-is, bundle differently, etc.). Name the change explicitly in your next comment (*"you're right that X — happy to keep both in this PR"*) so the trail is legible to anyone reviewing the discussion later.
+Update your position openly. If a credible counterargument arrives, acknowledge it and adjust (merge as-is, bundle differently). Name the change explicitly in your next comment ("you're right that X — happy to keep both in this PR") so the trail is legible to anyone reviewing the discussion later.
 
-If you find yourself rejecting every counterargument regardless of merit, you should have used Path C — and the contributor's time was wasted in the back-and-forth.
+If you find yourself rejecting every counterargument regardless of merit, you should have used [Path E](#path-e--close-and-replace) — and the contributor's time was wasted in the back-and-forth.
 
-### Path C — Close and Replace
+### Path E — Close and Replace
 
 Use when the audit reveals the PR's shape needs to change — different mechanism than the established pattern, scope expanded beyond what the contributor can reasonably reach (e.g. frontend changes on a backend-only PR), or knock-on consequences that can't be fixed by stacking commits.
 
 #### Iterate vs close-and-replace
 
-| Iterate on branch (Path A) | Close and replace (Path C) |
+| Iterate on branch ([Path B](#path-b--iterate-on-the-branch)) | Close and replace (Path E) |
 |---|---|
 | Same shape, small additions / fixes | Different mechanism from the established pattern |
 | Scope unchanged | Scope expanded into different files/areas the contributor can't easily test |
@@ -211,27 +254,41 @@ Use when the audit reveals the PR's shape needs to change — different mechanis
 
 If you've already asked the contributor to validate and you're now reconsidering the approach, **stop and re-audit first** — don't ask for a second validation round on a direction you're not confident in.
 
-#### Closing courtesy
+#### Closing comment
 
-Post the closing comment via the **GitHub PR UI**. Tone matters — the contributor identified a real gap; you're reshaping the fix, not rejecting the intent. Include:
+The contributor identified a real gap; you're reshaping the fix, not rejecting the intent. The comment must include:
 
 - **Apology if you changed your mind** after the contributor already validated. Own the reversal explicitly; don't frame it as if the new pattern was always obvious.
 - **Why** the shape needs to change, with file/line references — auditable, not opinion.
-- **What you'll do instead** — branch name, scope, and confirmation that you'll credit the contributor in the replacement PR. This makes the closure feel like continuation, not dismissal.
+- **What you'll do instead** — branch name (per [CONTRIBUTING.md → Branch Naming](./CONTRIBUTING.md#branch-naming)), scope, and confirmation that you'll credit the contributor in the replacement PR.
+
+```markdown
+Hi @contributor — thanks for catching this gap, and apologies for the reversal: I asked for a validation pass on this approach earlier, but after re-reading the audit I think the shape needs to change rather than be patched.
+
+## Why
+
+The current approach centralizes size checks in a per-call validator, but the established pattern in this codebase for similar concerns sits at the transport boundary (see `path/to/transport.ts:LL`, `path/to/other.ts:LL`). Rebuilding on top of the per-call shape would mean rewriting most of the diff after we converge — easier to start fresh with the transport-layer pattern.
+
+## What I'll do instead
+
+I'll open `fix/<scope>-transport-limit` in the next day or two, using the established pattern. You'll be credited in the replacement PR (`Co-authored-by:` trailer + cross-link from the description) — the audit instinct here is what made the fix possible.
+
+Closing as administrative housekeeping; reopening is always available if we end up wanting the per-call approach after all.
+```
 
 #### Attribution in the replacement PR
 
 The contributor must still get credit for spotting the issue, even if no line of their code survives in the replacement.
 
-**In the replacement PR description** (under `## Notes` or `## Related`):
+In the replacement PR description, under `## Notes` or `## Related`:
 
 ```markdown
-Builds on #NNN by @username, reshaped after review to <one-sentence reason>.
+Builds on #NNN by @contributor, reshaped after review to <one-sentence reason>.
 ```
 
 This creates two-way cross-links: the closed PR shows "Referenced in PR #MMM", and the new PR shows the original as context.
 
-**At squash-merge time,** add a `Co-authored-by:` trailer to the squash commit body. This is the **only acceptable exception** to the "leave extended description empty" rule. See [`Co-authored-by` Trailer Format](#co-authored-by-trailer-format) for the strict format.
+At squash-merge time, add a `Co-authored-by:` trailer to the squash commit body. This is the **only acceptable exception** to the "leave extended description empty" rule. See [`Co-authored-by` Trailer Format](#co-authored-by-trailer-format) for the strict format.
 
 ---
 
@@ -245,7 +302,8 @@ Extra discipline applies on top of the standard lifecycle:
 - **Match the defense to the threat.** A textbook-correct hardening pattern can still be wrong for the specific code path it's applied to — what's being compared, what an attacker can actually steer, and what the new code costs on the hot path all matter. Ask the contributor for an explicit threat model before merging, especially when the fix replaces an indexed lookup with a scan or otherwise trades performance for hardening.
 - **Surface DB-layer bypasses** in the PR comment even when fixed (e.g. implicit grants from upsert/ignore patterns, missing transaction boundaries, ORM defaults that skip validation).
 - **Require a threat model** in `## Security impact`: who is the attacker, what can they reach now, what is closed by this PR.
-- **Scope discipline.** If the audit finds out-of-scope issues, file separate PRs immediately rather than letting the original PR balloon.
+- **Require a regression test.** Per [Audit step 3](#2-audit), security PRs without a `*.test.ts` covering the closed vector are not merge-ready.
+- **Scope discipline.** If the audit finds out-of-scope issues, take the [Path C — Merge As-Is, Follow-up PR](#path-c--merge-as-is-follow-up-pr) route rather than letting the original PR balloon.
 - **No public CVE-style disclosure** in the PR description until the fix has shipped to a release. Use neutral framing (*"hardens authorization checks"*) instead of attack details.
 
 ---
@@ -254,11 +312,63 @@ Extra discipline applies on top of the standard lifecycle:
 
 Cross-cutting rules that apply across all review paths.
 
-- **Post review comments via the GitHub PR UI**, not `gh pr comment`. Markdown previews and `@mention` notifications behave differently between the two — the CLI path silently drops or mangles formatting that the UI gets right.
+- **Post review comments via the GitHub PR UI**, not `gh pr comment`. Markdown previews and `@mention` notifications behave differently between the two — the CLI path silently drops or mangles formatting that the UI gets right. **Exception:** when execution is delegated to an AI assistant under [Suggest by Default; Act on Confirmation](#suggest-by-default-act-on-confirmation), the assistant uses `gh pr comment <PR-NUMBER> --body-file <path>` because passing a file preserves the markdown the assistant drafted; the maintainer then verifies rendering on the PR page.
 - **Lead with acknowledgement, end with next steps.** This holds whether you're approving, requesting changes, asking for discussion, or closing.
 - **Use file:line references** instead of free-form prose when describing technical issues. The diff is the source of truth; pointing to it makes the comment auditable.
 - **Resolve conflicts locally**, not in the GitHub web UI. Web-resolved merges drop signing and bypass local checks.
 - **Never use `--no-verify`** or otherwise skip pre-commit hooks. If a hook fails, fix the underlying issue.
+
+### Suggest by Default; Act on Confirmation
+
+When you're contributing review work to a PR you are **not** personally merging — AI assistants, sub-reviewers doing first-pass triage, anyone whose output the merging maintainer will adopt — the default deliverable is exactly two artifacts:
+
+1. **A suggested commit message** following [CONTRIBUTING.md → Commit Messages](./CONTRIBUTING.md#commit-messages). If a branch name needs to be proposed, follow [CONTRIBUTING.md → Branch Naming](./CONTRIBUTING.md#branch-naming) exactly.
+2. **A suggested PR comment** matching the chosen review path — start from the worked example in the relevant subsection of [Review Paths](#review-paths) and adapt to the actual diff.
+
+The merging maintainer is the one who clicks "Squash and merge" on GitHub. Do not chain a meta-PR proposal (branch + commit + PR description) onto your own analysis output — that's the maintainer's call to make, not yours to script. If your work itself touches docs or code, leave the working tree in the right state and stop there. If the maintainer wants help drafting the commit message and PR comment for *that* change, they'll ask.
+
+This separation keeps audit accountability with the person who has merge rights, and prevents an upstream assistant's read of the diff from being rubber-stamped through the merge step.
+
+#### Two-stage execution (when the maintainer delegates)
+
+If the maintainer wants the assistant to carry the suggestion through to the PR, the assistant must ask for explicit confirmation at **two** points. Each stage is a separate yes — a "yes" at stage 1 is **not** consent for stage 2.
+
+**Stage 1 — Apply the fix.**
+After presenting the audit findings, ask: *"Should I apply the fix to the working tree?"*
+- If **yes**: edit files, then run `bun run check` and `bun run lint`. Stop after verification and report the working-tree state. Do not stage, commit, or push yet.
+- If **no**: stop. The maintainer will apply it themselves.
+
+**Stage 2 — Commit, push, and post the PR comment.**
+After Stage 1 lands and verifications are green, ask: *"Should I commit, push, and post the PR comment to #NNN?"* Include the proposed commit message and the PR comment markdown inline in the question so the maintainer is approving the exact text.
+- If **yes**: write the drafted PR comment to a temp markdown file (e.g. `/tmp/pr-NNN-comment.md`), then run the sequence below using the maintainer's existing git/gh credentials:
+  ```bash
+  git add <specific files, never -A unless explicitly requested>
+  git commit -m "<type>(<scope>): <subject>"
+  git push
+  gh pr comment <PR-NUMBER> --body-file /tmp/pr-NNN-comment.md
+  ```
+  Then report back with the pushed commit SHA and the comment URL so the maintainer can verify rendering on the PR page and click "Squash and merge".
+- If **no**: stop. The maintainer will run the steps manually.
+
+#### Constraints on Stage 2
+
+- **Use the maintainer's existing credentials.** Do not run `git config user.name` / `user.email`, do not pass `-c user.email=...`, do not set `GIT_AUTHOR_*` env vars. Whatever the maintainer's local git is configured to do is what gets committed.
+- **Never `--no-verify` or `--no-gpg-sign`.** If a pre-commit hook fails, fix the underlying issue and create a new commit — never amend the pre-hook state away.
+- **Never force-push** under this protocol. If push is rejected because the contributor's fork moved, stop and surface the conflict to the maintainer; do not `--force` or `--force-with-lease`.
+- **Never run `git merge` or the GitHub squash-merge** as part of Stage 2. The final merge button is the maintainer's, always.
+- **Stage files explicitly by name** — do not `git add -A` or `git add .` unless the maintainer asked for it. Adjacent uncommitted work from the maintainer's session must not be swept into the PR commit.
+- **Use `--body-file`, not `--body`,** for `gh pr comment`. This is the only sanctioned use of `gh pr comment` (see the exception under [Communication Norms](#communication-norms)) and only because passing a file preserves the markdown verbatim.
+- **Verify rendering.** After posting, report the comment URL so the maintainer can open it on the PR page and confirm formatting, mentions, and code blocks rendered correctly. If rendering looks wrong, the maintainer edits via the GitHub UI — the assistant does not delete and repost.
+
+#### When NOT to ask for Stage 2
+
+Some situations require maintainer hands on the keyboard. In these cases, deliver only the two default artifacts and stop — do **not** offer to execute, even if the maintainer typically delegates.
+
+- The audit is incomplete (adjacent code or adjacent patterns not yet checked).
+- The PR is security-sensitive and the threat model in `## Security impact` has not been reviewed end-to-end against the diff.
+- Stage 2 would require a force-push to land (rebase resolution, history rewrite).
+- The PR targets `main` directly rather than going through squash-merge via the UI.
+- The maintainer has not explicitly opted in this session. Silence is not consent.
 
 ---
 
@@ -283,7 +393,7 @@ If two maintainers disagree on a merge decision:
 
 ### `Co-authored-by` Trailer Format
 
-Used in squash-commit bodies when attributing a contributor whose PR was closed and reshaped (see [Path C — Close and Replace](#path-c--close-and-replace)). Format is strict — GitHub silently drops malformed trailers.
+Used in squash-commit bodies when attributing a contributor whose PR was closed and reshaped (see [Path E — Close and Replace](#path-e--close-and-replace)). Format is strict — GitHub silently drops malformed trailers.
 
 ```
 Co-authored-by: Full Name <email@example.com>
