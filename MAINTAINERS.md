@@ -304,10 +304,12 @@ Cross-cutting rules that apply across all review paths.
 
 ### Suggest by Default; Act on Confirmation
 
-When you're contributing review work to a PR you are **not** personally merging — AI assistants, sub-reviewers doing first-pass triage, anyone whose output the merging maintainer will adopt — the default deliverable is exactly two artifacts:
+When you're contributing review work to a PR you are **not** personally merging — AI assistants, sub-reviewers doing first-pass triage, anyone whose output the merging maintainer will adopt — the audit response always ships with exactly two artifacts:
 
-1. **A suggested commit message** following [CONTRIBUTING.md → Commit Messages](./CONTRIBUTING.md#commit-messages). If a branch name needs to be proposed, follow [CONTRIBUTING.md → Branch Naming](./CONTRIBUTING.md#branch-naming) exactly.
+1. **A suggested commit message** following [CONTRIBUTING.md → Commit Messages](./CONTRIBUTING.md#commit-messages). If a branch name needs to be proposed, follow [CONTRIBUTING.md → Branch Naming](./CONTRIBUTING.md#branch-naming) exactly. Path D — *Comment and Wait* — has no maintainer commit, so omit this artifact and note that the existing PR title will serve as the squash subject if the contributor's revisions land.
 2. **A suggested PR comment** matching the chosen review path — start from the worked example in the relevant subsection of [Review Paths](#review-paths) and adapt to the actual diff.
+
+**Draft these inline with the audit; never ask permission to draft.** "Should I draft a comment?" is the wrong question — the artifacts are part of the deliverable, not a follow-up offer. Confirmation gates exist only for *acting* on the suggestion (Stage 1: editing the working tree; Stage 2: committing, pushing, posting). A draft that lives only in chat hasn't touched the repo and doesn't need a gate.
 
 The merging maintainer is the one who clicks "Squash and merge" on GitHub. Do not chain a meta-PR proposal (branch + commit + PR description) onto your own analysis output — that's the maintainer's call to make, not yours to script. If your work itself touches docs or code, leave the working tree in the right state and stop there. If the maintainer wants help drafting the commit message and PR comment for *that* change, they'll ask.
 
@@ -315,7 +317,7 @@ This separation keeps audit accountability with the person who has merge rights,
 
 #### Two-stage execution (when the maintainer delegates)
 
-If the maintainer wants the assistant to carry the suggestion through to the PR, the assistant must ask for explicit confirmation at **two** points. Each stage is a separate yes — a "yes" at stage 1 is **not** consent for stage 2.
+If the maintainer wants the assistant to carry the suggestion through to the PR, the assistant must ask for explicit confirmation at **two** points. Each stage is a separate yes — a "yes" at stage 1 is **not** consent for stage 2. For Path D — where the deliverable is the PR comment alone with no code changes — Stage 1 doesn't apply; skip directly to Stage 2.
 
 **Stage 1 — Apply the fix.**
 After presenting the audit findings, ask: *"Should I apply the fix to the working tree?"*
