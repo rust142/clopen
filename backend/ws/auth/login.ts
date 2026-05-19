@@ -13,7 +13,7 @@ import {
 	createOrGetNoAuthAdmin,
 	needsSetup
 } from '$backend/auth/auth-service';
-import { settingsQueries } from '$backend/database/queries';
+import { settingsQueries, auditLogQueries } from '$backend/database/queries';
 import { getTokenType } from '$backend/auth/tokens';
 import { authRateLimiter } from '$backend/auth/rate-limiter';
 import { ws } from '$backend/utils/ws';
@@ -143,7 +143,14 @@ export const loginHandler = createRouter()
 				authRateLimiter.recordSuccess(ip);
 			}
 
-			// Set auth on connection
+			auditLogQueries.logEvent({
+				userId: result.user.id,
+				actorUserId: result.user.id,
+				eventType: 'auth:login',
+				eventDetails: `User ${result.user.name} logged in via ${tokenType} token`,
+				ipAddress: ip
+			});
+
 			ws.setAuth(conn, result.user.id, result.user.role, result.tokenHash);
 
 			return {
@@ -230,15 +237,21 @@ export const loginHandler = createRouter()
 	// Logout — clear session
 	.http('auth:logout', {
 		data: t.Object({}),
-		response: t.Object({
-			success: t.Boolean()
-		})
+		response: t.Object({ success: t.Boolean() })
 	}, async ({ conn }) => {
 		const state = ws.getConnectionState(conn);
-		if (state?.sessionTokenHash) {
-			logout(state.sessionTokenHash);
-		}
+		const userId = state?.userId;
+		if (state?.sessionTokenHash) logout(state.sessionTokenHash);
 		ws.clearAuth(conn);
+		if (userId) {
+			auditLogQueries.logEvent({
+				userId,
+				actorUserId: userId,
+				eventType: 'auth:logout',
+				eventDetails: 'User logged out',
+				ipAddress: ws.getRemoteAddress(conn)
+			});
+		}
 		return { success: true };
 	})
 
@@ -257,20 +270,19 @@ export const loginHandler = createRouter()
 	// Logout all sessions (admin only — used when switching auth mode)
 	.http('auth:logout-all', {
 		data: t.Object({}),
-		response: t.Object({
-			count: t.Number()
-		})
-	}, async () => {
+		response: t.Object({ count: t.Number() })
+	}, async ({ conn }) => {
+		const adminId = ws.getUserId(conn);
 		const count = logoutAllSessions();
-
-		// Broadcast force-logout to ALL connected clients before clearing auth.
-		// This ensures clients receive the event while still connected.
 		ws.emit.global('auth:force-logout', { reason: 'Auth mode changed' });
-
-		// Clear in-memory auth state on all active WebSocket connections.
-		// After this, the auth gate will block any further messages.
 		ws.clearAllAuth();
-
+		auditLogQueries.logEvent({
+			userId: adminId,
+			actorUserId: adminId,
+			eventType: 'auth:logout-all',
+			eventDetails: `Admin logged out all sessions (${count} sessions cleared)`,
+			ipAddress: ws.getRemoteAddress(conn)
+		});
 		return { count };
 	})
 
