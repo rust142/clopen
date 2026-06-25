@@ -40,7 +40,8 @@
 		GitConflictFile,
 		GitStashEntry,
 		GitTag,
-		GitRemote
+		GitRemote,
+		GitNestedRepoInfo
 	} from '$shared/types/git';
 
 	// Sub-components
@@ -163,7 +164,14 @@
 		return { fileName, dirPath: parts.join('/') };
 	}
 
-	async function handleDeleteRemoteBranch(remote: string, branch: string) {
+	function formatShortPath(fullPath: string): string {
+		if (!fullPath) return '';
+		return fullPath
+			.replace(/^\/Users\/[^/]+/, '~')
+			.replace(/^\/home\/[^/]+/, '~');
+	}
+
+	async function handleDeleteRemoteBranch(remote: string, branch: string, repoPath?: string) {
 		requestConfirm({
 			title: 'Delete remote branch',
 			message: `Delete branch "${branch}" from "${remote}"? This cannot be undone.`,
@@ -171,10 +179,10 @@
 			confirmText: 'Delete',
 			onConfirm: async () => {
 				if (!projectId) return;
-				const key = `${remote}/${branch}`;
+				const key = nestedRemoteBranchKey(remote, branch, repoPath);
 				deletingRemoteBranch = key;
 				try {
-					await ws.http('git:delete-remote-branch', { projectId, remote, branch });
+					await ws.http('git:delete-remote-branch', { projectId, remote, branch, repoPath });
 					await loadBranches();
 				} catch (err) {
 					debug.error('git', 'Failed to delete remote branch:', err);
@@ -194,7 +202,21 @@
 	let mergeBranchName = $state('');
 	let mergeMode = $state<'default' | 'no-ff'>('default');
 	let showConflictResolver = $state(false);
-	const mergeableBranches = $derived(branchInfo?.local.filter(branch => !branch.isCurrent) ?? []);
+	let mergeRepoPath = $state<string | null>(null);
+	const mergeableBranches = $derived.by(() => {
+		if (mergeRepoPath) {
+			const nested = branchInfo?.nested?.find(n => n.path === mergeRepoPath);
+			return nested?.info.local.filter(branch => !branch.isCurrent) ?? [];
+		}
+		return branchInfo?.local.filter(branch => !branch.isCurrent) ?? [];
+	});
+	const mergeTargetBranch = $derived.by(() => {
+		if (mergeRepoPath) {
+			const nested = branchInfo?.nested?.find(n => n.path === mergeRepoPath);
+			return nested?.info.current ?? 'current branch';
+		}
+		return branchInfo?.current ?? 'current branch';
+	});
 
 	// Local branch names that already exist on at least one remote
 	// (matched by suffix `/{name}` on any remote branch). Used to decide
@@ -228,24 +250,34 @@
 	let isInitializing = $state(false);
 
 	// Stash state
-	let stashEntries = $state<GitStashEntry[]>([]);
+	interface StashEntryExtended extends GitStashEntry {
+		repoPath?: string;
+		repoRelPath?: string;
+	}
+	let stashEntries = $state<StashEntryExtended[]>([]);
 	let isStashLoading = $state(false);
 	let showStashSaveForm = $state(false);
 	let stashMessage = $state('');
 	// When true, the create-stash form stashes only the index (`git stash push
 	// --staged`); otherwise it stashes all changes.
 	let stashStagedOnly = $state(false);
+	let stashRepoPath = $state<string | undefined>(undefined);
 	// Inline expanded stash entries → their file list (lazy-loaded), like the
 	// per-commit file list under a branch.
-	let expandedStashes = $state<Set<number>>(new Set());
-	let stashFileState = $state<Record<number, { files: GitFileDiff[]; isLoading: boolean }>>({});
+	let expandedStashes = $state<Set<string>>(new Set());
+	let stashFileState = $state<Record<string, { files: GitFileDiff[]; isLoading: boolean }>>({});
 
 	// Tags state
-	let tags = $state<GitTag[]>([]);
+	interface TagExtended extends GitTag {
+		repoPath?: string;
+		repoRelPath?: string;
+	}
+	let tags = $state<TagExtended[]>([]);
 	let isTagsLoading = $state(false);
 	let showCreateTagForm = $state(false);
 	let newTagName = $state('');
 	let newTagMessage = $state('');
+	let tagRepoPath = $state<string | undefined>(undefined);
 
 	// Inline create branch state
 	let showCreateBranchForm = $state(false);
@@ -255,17 +287,469 @@
 	let branchesSearchQuery = $state('');
 	let branchesSubTab = $state<'local' | 'remote'>('local');
 
+	// Per-nested-repo branches view state
+	let nestedSearchQueries = $state<Record<string, string>>({});
+	let nestedRemoteSearchQueries = $state<Record<string, string>>({});
+	let nestedShowCreateForm = $state<Record<string, boolean>>({});
+	let nestedNewBranchNames = $state<Record<string, string>>({});
+	let nestedBranchesSubTabs = $state<Record<string, 'local' | 'remote'>>({});
+	let nestedReposHeight = $state(300);
+	let nestedReposHeights = $state<Record<string, number>>({});
+	let isNestedRepoResizing = $state<Record<string, boolean>>({});
+	let mainBranchesHeight = $state<number | undefined>(undefined);
+	let mainChangesHeight = $state<number | undefined>(undefined);
+	let mainLogHeight = $state<number | undefined>(undefined);
+	let mainStashHeight = $state<number | undefined>(undefined);
+	let mainTagsHeight = $state<number | undefined>(undefined);
+	let mainContributorsHeight = $state<number | undefined>(undefined);
+	let nestedReposCollapsed = $state<Record<string, boolean>>({});
+	const MIN_NESTED_REPO_HEIGHT = 250;
+	const MAX_NESTED_REPO_HEIGHT = 500;
+
+	// When all nested subrepos are collapsed, reset the main heights so the main
+	// content area grows back to fill the panel (no dead space left behind).
+	$effect(() => {
+		const nested = branchInfo?.nested;
+		if (!nested || nested.length === 0) return;
+		const allCollapsed = nested.every(n => nestedReposCollapsed[n.relPath] !== undefined
+			? nestedReposCollapsed[n.relPath]
+			: true);
+		if (allCollapsed) {
+			mainChangesHeight = undefined;
+			mainBranchesHeight = undefined;
+			mainLogHeight = undefined;
+			mainStashHeight = undefined;
+			mainTagsHeight = undefined;
+			mainContributorsHeight = undefined;
+		}
+	});
+
+	function toggleNestedRepoCollapsed(relPath: string) {
+		if (!branchInfo?.nested) return;
+
+		const repoIndex = branchInfo.nested.findIndex(r => r.relPath === relPath);
+		const defaultCollapsed = true;
+		const currentCollapsed = nestedReposCollapsed[relPath] !== undefined
+			? nestedReposCollapsed[relPath]
+			: defaultCollapsed;
+
+		const isExpanding = currentCollapsed;
+
+		if (isExpanding) {
+			// Accordion: collapse every other nested repo so only one stays open at a time.
+			const nextCollapsedState: Record<string, boolean> = {};
+			for (const repo of branchInfo.nested) {
+				nextCollapsedState[repo.relPath] = repo.relPath !== relPath;
+			}
+			nestedReposCollapsed = { ...nestedReposCollapsed, ...nextCollapsedState };
+
+			if (activeView === 'log') {
+				const nested = branchInfo.nested.find(r => r.relPath === relPath);
+				if (nested && (!nestedCommits[relPath] || nestedCommits[relPath].length === 0)) {
+					loadNestedLog(relPath, nested.path, true);
+				}
+			}
+		} else {
+			nestedReposCollapsed = {
+				...nestedReposCollapsed,
+				[relPath]: true
+			};
+		}
+	}
+
+	function startNestedRepoResize(e: MouseEvent, relPath: string) {
+		e.preventDefault();
+		e.stopPropagation();
+		isNestedRepoResizing = { ...isNestedRepoResizing, [relPath]: true };
+		const startY = e.clientY;
+		const subrepoEl = (e.currentTarget as HTMLElement).parentElement;
+		const startHeight = nestedReposHeights[relPath] ?? (subrepoEl?.offsetHeight ?? 260);
+		const mainListEl = subrepoEl?.previousElementSibling as HTMLElement | null;
+		const hasMainList = mainListEl && mainListEl.classList.contains('overflow-y-auto');
+		const startMainHeight = hasMainList ? mainListEl.offsetHeight : 0;
+
+		function onMove(ev: MouseEvent) {
+			const delta = ev.clientY - startY;
+
+			// Enforce at least 3 main repo branches are visible (approx 120px minimum height)
+			let maxAllowedSubHeight = MAX_NESTED_REPO_HEIGHT;
+			if (hasMainList && mainListEl) {
+				maxAllowedSubHeight = Math.min(MAX_NESTED_REPO_HEIGHT, startHeight + startMainHeight - 120);
+			}
+
+			const newSubHeight = Math.min(
+				maxAllowedSubHeight,
+				Math.max(MIN_NESTED_REPO_HEIGHT, startHeight - delta)
+			);
+
+			if (hasMainList && mainListEl) {
+				const actualDelta = newSubHeight - startHeight;
+				mainBranchesHeight = startMainHeight - actualDelta;
+			}
+			nestedReposHeights = { ...nestedReposHeights, [relPath]: newSubHeight };
+		}
+		function onUp() {
+			isNestedRepoResizing = { ...isNestedRepoResizing, [relPath]: false };
+			window.removeEventListener('mousemove', onMove);
+			window.removeEventListener('mouseup', onUp);
+			markGitUiDirty();
+		}
+		window.addEventListener('mousemove', onMove);
+		window.addEventListener('mouseup', onUp);
+	}
+
+	function startNestedChangesResize(e: MouseEvent, relPath: string) {
+		e.preventDefault();
+		e.stopPropagation();
+		isNestedRepoResizing = { ...isNestedRepoResizing, [relPath]: true };
+		const startY = e.clientY;
+		const subrepoEl = (e.currentTarget as HTMLElement).parentElement;
+		const startHeight = nestedReposHeights[relPath] ?? (subrepoEl?.offsetHeight ?? 260);
+		const mainListEl = subrepoEl?.previousElementSibling as HTMLElement | null;
+		const hasMainList = mainListEl && mainListEl.classList.contains('overflow-y-auto');
+		const startMainHeight = hasMainList ? mainListEl.offsetHeight : 0;
+
+		function onMove(ev: MouseEvent) {
+			const delta = ev.clientY - startY;
+			let maxAllowedSubHeight = MAX_NESTED_REPO_HEIGHT;
+			if (hasMainList && mainListEl) {
+				maxAllowedSubHeight = Math.min(MAX_NESTED_REPO_HEIGHT, startHeight + startMainHeight - 80);
+			}
+			const newSubHeight = Math.min(
+				maxAllowedSubHeight,
+				Math.max(MIN_NESTED_REPO_HEIGHT, startHeight - delta)
+			);
+			if (hasMainList && mainListEl) {
+				const actualDelta = newSubHeight - startHeight;
+				mainChangesHeight = startMainHeight - actualDelta;
+			}
+			nestedReposHeights = { ...nestedReposHeights, [relPath]: newSubHeight };
+		}
+		function onUp() {
+			isNestedRepoResizing = { ...isNestedRepoResizing, [relPath]: false };
+			window.removeEventListener('mousemove', onMove);
+			window.removeEventListener('mouseup', onUp);
+			markGitUiDirty();
+		}
+		window.addEventListener('mousemove', onMove);
+		window.addEventListener('mouseup', onUp);
+	}
+
+	function startNestedLogResize(e: MouseEvent, relPath: string) {
+		e.preventDefault();
+		e.stopPropagation();
+		isNestedRepoResizing = { ...isNestedRepoResizing, [relPath]: true };
+		const startY = e.clientY;
+		const subrepoEl = (e.currentTarget as HTMLElement).parentElement;
+		const startHeight = nestedReposHeights[relPath] ?? (subrepoEl?.offsetHeight ?? 260);
+		const mainListEl = subrepoEl?.previousElementSibling as HTMLElement | null;
+		const hasMainList = mainListEl && (mainListEl.classList.contains('overflow-y-auto') || mainListEl.querySelector('.overflow-y-auto'));
+		const actualMainListEl = mainListEl && mainListEl.classList.contains('overflow-y-auto')
+			? mainListEl
+			: (mainListEl?.querySelector('.overflow-y-auto') as HTMLElement | null);
+		const startMainHeight = actualMainListEl ? actualMainListEl.offsetHeight : 0;
+
+		function onMove(ev: MouseEvent) {
+			const delta = ev.clientY - startY;
+
+			let maxAllowedSubHeight = MAX_NESTED_REPO_HEIGHT;
+			if (actualMainListEl) {
+				maxAllowedSubHeight = Math.min(MAX_NESTED_REPO_HEIGHT, startHeight + startMainHeight - 144);
+			}
+
+			const newSubHeight = Math.min(
+				maxAllowedSubHeight,
+				Math.max(MIN_NESTED_REPO_HEIGHT, startHeight - delta)
+			);
+
+			if (actualMainListEl) {
+				const actualDelta = newSubHeight - startHeight;
+				mainLogHeight = startMainHeight - actualDelta;
+			}
+			nestedReposHeights = { ...nestedReposHeights, [relPath]: newSubHeight };
+		}
+		function onUp() {
+			isNestedRepoResizing = { ...isNestedRepoResizing, [relPath]: false };
+			window.removeEventListener('mousemove', onMove);
+			window.removeEventListener('mouseup', onUp);
+			markGitUiDirty();
+		}
+		window.addEventListener('mousemove', onMove);
+		window.addEventListener('mouseup', onUp);
+	}
+
+	function startNestedStashResize(e: MouseEvent, relPath: string) {
+		e.preventDefault();
+		e.stopPropagation();
+		isNestedRepoResizing = { ...isNestedRepoResizing, [relPath]: true };
+		const startY = e.clientY;
+		const subrepoEl = (e.currentTarget as HTMLElement).parentElement;
+		const startHeight = nestedReposHeights[relPath] ?? (subrepoEl?.offsetHeight ?? 260);
+		const mainListEl = subrepoEl?.previousElementSibling as HTMLElement | null;
+		const hasMainList = mainListEl && (mainListEl.classList.contains('overflow-y-auto') || mainListEl.querySelector('.overflow-y-auto'));
+		const actualMainListEl = mainListEl && mainListEl.classList.contains('overflow-y-auto')
+			? mainListEl
+			: (mainListEl?.querySelector('.overflow-y-auto') as HTMLElement | null);
+		const startMainHeight = actualMainListEl ? actualMainListEl.offsetHeight : 0;
+
+		function onMove(ev: MouseEvent) {
+			const delta = ev.clientY - startY;
+
+			let maxAllowedSubHeight = MAX_NESTED_REPO_HEIGHT;
+			if (actualMainListEl) {
+				maxAllowedSubHeight = Math.min(MAX_NESTED_REPO_HEIGHT, startHeight + startMainHeight - 120);
+			}
+
+			const newSubHeight = Math.min(
+				maxAllowedSubHeight,
+				Math.max(MIN_NESTED_REPO_HEIGHT, startHeight - delta)
+			);
+
+			if (actualMainListEl) {
+				const actualDelta = newSubHeight - startHeight;
+				mainStashHeight = startMainHeight - actualDelta;
+			}
+			nestedReposHeights = { ...nestedReposHeights, [relPath]: newSubHeight };
+		}
+		function onUp() {
+			isNestedRepoResizing = { ...isNestedRepoResizing, [relPath]: false };
+			window.removeEventListener('mousemove', onMove);
+			window.removeEventListener('mouseup', onUp);
+			markGitUiDirty();
+		}
+		window.addEventListener('mousemove', onMove);
+		window.addEventListener('mouseup', onUp);
+	}
+
+	function startNestedTagsResize(e: MouseEvent, relPath: string) {
+		e.preventDefault();
+		e.stopPropagation();
+		isNestedRepoResizing = { ...isNestedRepoResizing, [relPath]: true };
+		const startY = e.clientY;
+		const subrepoEl = (e.currentTarget as HTMLElement).parentElement;
+		const startHeight = nestedReposHeights[relPath] ?? (subrepoEl?.offsetHeight ?? 260);
+		const mainListEl = subrepoEl?.previousElementSibling as HTMLElement | null;
+		const hasMainList = mainListEl && (mainListEl.classList.contains('overflow-y-auto') || mainListEl.querySelector('.overflow-y-auto'));
+		const actualMainListEl = mainListEl && mainListEl.classList.contains('overflow-y-auto')
+			? mainListEl
+			: (mainListEl?.querySelector('.overflow-y-auto') as HTMLElement | null);
+		const startMainHeight = actualMainListEl ? actualMainListEl.offsetHeight : 0;
+
+		function onMove(ev: MouseEvent) {
+			const delta = ev.clientY - startY;
+
+			let maxAllowedSubHeight = MAX_NESTED_REPO_HEIGHT;
+			if (actualMainListEl) {
+				maxAllowedSubHeight = Math.min(MAX_NESTED_REPO_HEIGHT, startHeight + startMainHeight - 120);
+			}
+
+			const newSubHeight = Math.min(
+				maxAllowedSubHeight,
+				Math.max(MIN_NESTED_REPO_HEIGHT, startHeight - delta)
+			);
+
+			if (actualMainListEl) {
+				const actualDelta = newSubHeight - startHeight;
+				mainTagsHeight = startMainHeight - actualDelta;
+			}
+			nestedReposHeights = { ...nestedReposHeights, [relPath]: newSubHeight };
+		}
+		function onUp() {
+			isNestedRepoResizing = { ...isNestedRepoResizing, [relPath]: false };
+			window.removeEventListener('mousemove', onMove);
+			window.removeEventListener('mouseup', onUp);
+			markGitUiDirty();
+		}
+		window.addEventListener('mousemove', onMove);
+		window.addEventListener('mouseup', onUp);
+	}
+
+	function startNestedContributorsResize(e: MouseEvent, relPath: string) {
+		e.preventDefault();
+		e.stopPropagation();
+		isNestedRepoResizing = { ...isNestedRepoResizing, [relPath]: true };
+		const startY = e.clientY;
+		const subrepoEl = (e.currentTarget as HTMLElement).parentElement;
+		const startHeight = nestedReposHeights[relPath] ?? (subrepoEl?.offsetHeight ?? 260);
+		const mainListEl = subrepoEl?.previousElementSibling as HTMLElement | null;
+		const hasMainList = mainListEl && (mainListEl.classList.contains('overflow-y-auto') || mainListEl.querySelector('.overflow-y-auto'));
+		const actualMainListEl = mainListEl && mainListEl.classList.contains('overflow-y-auto')
+			? mainListEl
+			: (mainListEl?.querySelector('.overflow-y-auto') as HTMLElement | null);
+		const startMainHeight = actualMainListEl ? actualMainListEl.offsetHeight : 0;
+
+		function onMove(ev: MouseEvent) {
+			const delta = ev.clientY - startY;
+
+			let maxAllowedSubHeight = MAX_NESTED_REPO_HEIGHT;
+			if (actualMainListEl) {
+				maxAllowedSubHeight = Math.min(MAX_NESTED_REPO_HEIGHT, startHeight + startMainHeight - 120);
+			}
+
+			const newSubHeight = Math.min(
+				maxAllowedSubHeight,
+				Math.max(MIN_NESTED_REPO_HEIGHT, startHeight - delta)
+			);
+
+			if (actualMainListEl) {
+				const actualDelta = newSubHeight - startHeight;
+				mainContributorsHeight = startMainHeight - actualDelta;
+			}
+			nestedReposHeights = { ...nestedReposHeights, [relPath]: newSubHeight };
+		}
+		function onUp() {
+			isNestedRepoResizing = { ...isNestedRepoResizing, [relPath]: false };
+			window.removeEventListener('mousemove', onMove);
+			window.removeEventListener('mouseup', onUp);
+			markGitUiDirty();
+		}
+		window.addEventListener('mousemove', onMove);
+		window.addEventListener('mouseup', onUp);
+	}
+
+	function nestedSearchQuery(relPath: string): string {
+		return nestedSearchQueries[relPath] ?? '';
+	}
+	function setNestedSearchQuery(relPath: string, value: string) {
+		nestedSearchQueries = { ...nestedSearchQueries, [relPath]: value };
+	}
+	function nestedRemoteSearchQuery(relPath: string): string {
+		return nestedRemoteSearchQueries[relPath] ?? '';
+	}
+	function setNestedRemoteSearchQuery(relPath: string, value: string) {
+		nestedRemoteSearchQueries = { ...nestedRemoteSearchQueries, [relPath]: value };
+	}
+	function nestedBranchesSubTab(relPath: string): 'local' | 'remote' {
+		return nestedBranchesSubTabs[relPath] ?? 'local';
+	}
+	function setNestedBranchesSubTab(relPath: string, value: 'local' | 'remote') {
+		nestedBranchesSubTabs = { ...nestedBranchesSubTabs, [relPath]: value };
+		nestedSearchQueries = { ...nestedSearchQueries, [relPath]: '' };
+		nestedRemoteSearchQueries = { ...nestedRemoteSearchQueries, [relPath]: '' };
+	}
+	function toggleNestedCreateForm(relPath: string) {
+		nestedShowCreateForm = { ...nestedShowCreateForm, [relPath]: !nestedShowCreateForm[relPath] };
+		if (!nestedShowCreateForm[relPath]) {
+			nestedNewBranchNames = { ...nestedNewBranchNames, [relPath]: '' };
+		}
+	}
+	function nestedNewBranchName(relPath: string): string {
+		return nestedNewBranchNames[relPath] ?? '';
+	}
+	function setNestedNewBranchName(relPath: string, value: string) {
+		nestedNewBranchNames = { ...nestedNewBranchNames, [relPath]: value };
+	}
+
+	function nestedRemoteBranchKey(remote: string, branch: string, repoPath?: string): string {
+		return repoPath ? `${repoPath}::${remote}/${branch}` : `${remote}/${branch}`;
+	}
+
 	const filteredLocalBranches = $derived(
 		branchInfo?.local.filter(b =>
-			!branchesSearchQuery || b.name.toLowerCase().includes(branchesSearchQuery.toLowerCase())
+			branchesSubTab !== 'local' || !branchesSearchQuery || b.name.toLowerCase().includes(branchesSearchQuery.toLowerCase())
 		) ?? []
 	);
 
 	const filteredRemoteBranches = $derived(
 		branchInfo?.remote.filter(b =>
-			!branchesSearchQuery || b.name.toLowerCase().includes(branchesSearchQuery.toLowerCase())
+			branchesSubTab !== 'remote' || !branchesSearchQuery || b.name.toLowerCase().includes(branchesSearchQuery.toLowerCase())
 		) ?? []
 	);
+
+	function filteredNestedLocalBranches(nested: GitNestedRepoInfo): GitBranch[] {
+		const q = nestedSearchQuery(nested.relPath);
+		return nested.info.local.filter(b => !q || b.name.toLowerCase().includes(q.toLowerCase()));
+	}
+	function filteredNestedRemoteBranches(nested: GitNestedRepoInfo): GitBranch[] {
+		const q = nestedRemoteSearchQuery(nested.relPath);
+		return nested.info.remote.filter(b => !q || b.name.toLowerCase().includes(q.toLowerCase()));
+	}
+	function nestedRemoteNames(nested: GitNestedRepoInfo): string[] {
+		const names = new Set<string>();
+		const q = nestedRemoteSearchQuery(nested.relPath);
+		for (const b of nested.info.remote) {
+			const slash = b.name.indexOf('/');
+			if (slash < 0) continue;
+			const short = b.name.substring(slash + 1);
+			if (q && !short.toLowerCase().includes(q.toLowerCase())) continue;
+			names.add(b.name.substring(0, slash));
+		}
+		return [...names];
+	}
+	function getNestedSelectedRemote(nested: GitNestedRepoInfo): string {
+		const subRemotes = nestedRemoteNames(nested);
+		if (subRemotes.length === 0) return 'origin';
+		if (subRemotes.includes(selectedRemote)) return selectedRemote;
+		return subRemotes[0];
+	}
+	function pushedBranchNamesFromInfo(info: GitBranchInfo): Set<string> {
+		const set = new Set<string>();
+		for (const r of info.remote) {
+			const slash = r.name.indexOf('/');
+			if (slash >= 0) set.add(r.name.substring(slash + 1));
+		}
+		return set;
+	}
+	function nestedPushedBranchNames(nested: GitNestedRepoInfo): Set<string> {
+		return pushedBranchNamesFromInfo(nested.info);
+	}
+	async function handleCreateNestedBranch(nested: GitNestedRepoInfo) {
+		if (!projectId) return;
+		const name = nestedNewBranchName(nested.relPath).trim();
+		if (!name) return;
+		try {
+			await ws.http('git:create-branch', { projectId, name, repoPath: nested.path });
+			showInfo('Branch Created', `Created "${name}" in ${nested.relPath}.`);
+			nestedNewBranchNames = { ...nestedNewBranchNames, [nested.relPath]: '' };
+			nestedShowCreateForm = { ...nestedShowCreateForm, [nested.relPath]: false };
+			await loadBranches();
+		} catch (err) {
+			debug.error('git', 'Failed to create nested branch:', err);
+			showError('Create Branch Failed', err instanceof Error ? err.message : 'Unknown error');
+		}
+	}
+	async function handleSwitchNestedBranch(nested: GitNestedRepoInfo, name: string) {
+		if (!projectId) return;
+		try {
+			await ws.http('git:switch-branch', { projectId, name, repoPath: nested.path });
+			showInfo('Switched Branch', `Switched to "${name}" in ${nested.relPath}.`);
+			await loadBranches();
+		} catch (err) {
+			debug.error('git', 'Failed to switch nested branch:', err);
+			showError('Switch Branch Failed', err instanceof Error ? err.message : 'Unknown error');
+		}
+	}
+	function handleDeleteNestedBranch(nested: GitNestedRepoInfo, name: string) {
+		requestConfirm({
+			title: 'Delete Branch',
+			message: `Delete branch "${name}" in ${nested.relPath}?`,
+			type: 'error',
+			confirmText: 'Delete',
+			onConfirm: async () => {
+				if (!projectId) return;
+				try {
+					await ws.http('git:delete-branch', { projectId, name, repoPath: nested.path });
+					await loadBranches();
+				} catch (err) {
+					debug.error('git', 'Failed to delete nested branch:', err);
+					requestConfirm({
+						title: 'Force Delete Branch',
+						message: 'Branch is not fully merged. Force delete?',
+						type: 'error',
+						confirmText: 'Force Delete',
+						onConfirm: async () => {
+							try {
+								await ws.http('git:delete-branch', { projectId, name, force: true, repoPath: nested.path });
+								await loadBranches();
+							} catch (forceErr) {
+								showError('Force Delete Failed', forceErr instanceof Error ? forceErr.message : 'Unknown error');
+							}
+						}
+					});
+				}
+			}
+		});
+	}
 
 	interface BranchCommitState {
 		commits: GitCommit[];
@@ -302,6 +786,12 @@
 	let expandedContributors = $state<Set<string>>(new Set());
 	let isContributorsLoading = $state(false);
 
+	// Nested contributors state
+	let nestedContributors = $state<Record<string, ContributorEntry[]>>({});
+	let nestedContributorTotal = $state<Record<string, number>>({});
+	let nestedContributorLog = $state<Record<string, GitCommit[]>>({});
+	let nestedIsContributorsLoading = $state<Record<string, boolean>>({});
+
 	// How many of a contributor's commits are rendered. Paginated client-side
 	// from the in-memory sample (same page size as the Branches commit list) so a
 	// prolific author doesn't mount hundreds of rows at once.
@@ -326,8 +816,11 @@
 		contributorVisible = { ...contributorVisible, [key]: current + CONTRIBUTOR_COMMIT_PAGE_SIZE };
 	}
 
-	function contributorCommits(key: string): GitCommit[] {
-		return contributorLog.filter(c => (c.authorEmail || c.author).toLowerCase().trim() === key);
+	function contributorCommits(key: string, repoPath?: string): GitCommit[] {
+		const log = repoPath && branchInfo?.nested
+			? (nestedContributorLog[branchInfo.nested.find(n => n.path === repoPath)?.relPath ?? ''] || [])
+			: contributorLog;
+		return log.filter(c => (c.authorEmail || c.author).toLowerCase().trim() === key);
 	}
 
 	// Tab system (like Files panel)
@@ -401,9 +894,13 @@
 
 	// Log state
 	let commits = $state<GitCommit[]>([]);
+	let nestedCommits = $state<Record<string, GitCommit[]>>({});
 	let isLogLoading = $state(false);
+	let nestedIsLogLoading = $state<Record<string, boolean>>({});
 	let logHasMore = $state(false);
+	let nestedLogHasMore = $state<Record<string, boolean>>({});
 	let logSkip = $state(0);
+	let nestedLogSkip = $state<Record<string, number>>({});
 	// A commit detail to re-open once the log finishes loading (per-project restore).
 	let pendingSelectedCommitHash = $state<string | null>(null);
 	// A diff tab to re-open once its data source is loaded (per-project restore):
@@ -540,7 +1037,7 @@
 		const token = ++branchesLoadToken;
 		isLoadingBranches = true;
 		try {
-			const data = await ws.http('git:branches', { projectId, selectedRemote: useRemote });
+			const data = await ws.http('git:branches', { projectId, selectedRemote: useRemote }) as GitBranchInfo;
 			if (token !== branchesLoadToken) return null; // stale — newer load in flight
 			branchInfo = data;
 			return data;
@@ -605,6 +1102,45 @@
 			debug.error('git', 'Failed to load log:', err);
 		} finally {
 			isLogLoading = false;
+		}
+	}
+
+	async function loadNestedLog(relPath: string, repoPath: string, reset = false) {
+		if (!projectId) return;
+		if (nestedIsLogLoading[relPath]) return;
+
+		nestedIsLogLoading = { ...nestedIsLogLoading, [relPath]: true };
+		try {
+			const currentSkip = reset ? 0 : (nestedLogSkip[relPath] || 0);
+			const data = await ws.http('git:log', { projectId, repoPath, limit: 50, skip: currentSkip });
+			if (reset) {
+				nestedCommits = { ...nestedCommits, [relPath]: data.commits };
+				nestedLogSkip = { ...nestedLogSkip, [relPath]: data.commits.length };
+			} else {
+				const prev = nestedCommits[relPath] || [];
+				nestedCommits = { ...nestedCommits, [relPath]: [...prev, ...data.commits] };
+				nestedLogSkip = { ...nestedLogSkip, [relPath]: currentSkip + data.commits.length };
+			}
+			nestedLogHasMore = { ...nestedLogHasMore, [relPath]: data.hasMore };
+		} catch (err) {
+			debug.error('git', `Failed to load nested log for ${relPath}:`, err);
+		} finally {
+			nestedIsLogLoading = { ...nestedIsLogLoading, [relPath]: false };
+		}
+	}
+
+	async function refreshAllLogs() {
+		if (activeView !== 'log') return;
+		await loadLog(true);
+		if (branchInfo?.nested) {
+			for (const nested of branchInfo.nested) {
+				const isCollapsed = nestedReposCollapsed[nested.relPath] !== undefined
+					? nestedReposCollapsed[nested.relPath]
+					: true;
+				if (!isCollapsed) {
+					await loadNestedLog(nested.relPath, nested.path, true);
+				}
+			}
 		}
 	}
 
@@ -714,11 +1250,11 @@
 		}
 	}
 
-	async function handlePushBranch(branch: string) {
+	async function handlePushBranch(branch: string, repoPath?: string) {
 		if (!projectId) return;
 		pushingBranch = branch;
 		try {
-			const result = await ws.http('git:push', { projectId, branch }) as { success: boolean; message: string };
+			const result = await ws.http('git:push', { projectId, branch, repoPath }) as { success: boolean; message: string };
 			showInfo(result.success ? 'Pushed' : 'Push failed', result.message);
 			await loadBranches();
 		} catch (err) {
@@ -728,10 +1264,99 @@
 		}
 	}
 
-	async function handleCherryPick(hash: string) {
+	// Push the current branch from the branch list. If the branch has
+	// diverged from the remote (ahead AND behind, e.g. after undoing a
+	// pushed commit), a normal push would be rejected — offer a force
+	// push (with lease) instead, gated behind a confirmation modal.
+	async function handlePushFromBranchList(branch: GitBranch, repoPath?: string) {
+		if (!projectId) return;
+		const info = repoPath
+			? branchInfo?.nested?.find(n => n.path === repoPath)?.info
+			: branchInfo;
+		const pushed = info ? pushedBranchNamesFromInfo(info) : pushedBranchNames;
+		const isDiverged = branch.isCurrent
+			&& pushed.has(branch.name)
+			&& (info?.ahead ?? 0) > 0
+			&& (info?.behind ?? 0) > 0;
+		if (isDiverged) {
+			requestConfirm({
+				title: 'Force Push',
+				message: `"${branch.name}" has diverged from the remote (${info?.ahead} ahead, ${info?.behind} behind). A normal push would be rejected. Force push (with lease) to overwrite the remote?`,
+				type: 'warning',
+				confirmText: 'Force Push',
+				onConfirm: () => void handlePushBranchForce(branch.name, repoPath)
+			});
+		} else {
+			void handlePushBranch(branch.name, repoPath);
+		}
+	}
+
+	async function handlePushBranchForce(branch: string, repoPath?: string) {
+		if (!projectId) return;
+		pushingBranch = branch;
+		try {
+			const result = await ws.http('git:push-advanced', {
+				projectId,
+				mode: 'force-lease',
+				remote: selectedRemote,
+				branch,
+				repoPath
+			}) as { success: boolean; message: string };
+			if (result.success) {
+				await loadBranches();
+				await loadTags();
+				showInfo('Force Pushed', `Force-pushed ${branch} to ${selectedRemote}.`);
+			} else {
+				showError('Force Push Failed', result.message);
+			}
+		} catch (err) {
+			debug.error('git', 'Force push from branch list failed:', err);
+			showError('Force Push Failed', err instanceof Error ? err.message : 'Unknown error');
+		} finally {
+			pushingBranch = null;
+		}
+	}
+
+	// Load all per-file diffs for a commit and open them as tabs so the
+	// user can browse every changed file from the branch list without
+	// expanding the commit first.
+	async function handleViewCommitDiffs(commit: GitCommit, repoPath?: string) {
 		if (!projectId) return;
 		try {
-			const result = await ws.http('git:cherry-pick', { projectId, hashes: [hash] }) as { success: boolean; message: string };
+			const diffs = await ws.http('git:diff-commit', { projectId, commitHash: commit.hash, repoPath }) as GitFileDiff[];
+			if (!diffs || diffs.length === 0) {
+				showInfo('No Changes', 'This commit has no file changes.');
+				return;
+			}
+			const tabs: DiffTab[] = diffs.map(file => {
+				const path = file.newPath || file.oldPath;
+				const fileName = path.split(/[\\/]/).pop() || path;
+				return {
+					id: `commit:${commit.hash}:${path}`,
+					filePath: path,
+					fileName,
+					section: 'commit',
+					diff: file,
+					diffs: [],
+					isLoading: false,
+					commitHash: commit.hash,
+					status: file.status
+				};
+			});
+			openTabs = tabs;
+			activeTabId = tabs[0]?.id ?? null;
+			if (!isTwoColumnMode) viewMode = 'diff';
+			markGitUiDirty();
+		} catch (err) {
+			debug.error('git', 'Failed to load commit diffs:', err);
+			showError('Diff Failed', err instanceof Error ? err.message : 'Unknown error');
+		}
+	}
+
+	async function handleCherryPick(hash: string, repoPath?: string) {
+		if (!projectId) return;
+		try {
+			const result = await ws.http('git:cherry-pick', { projectId, hashes: [hash], repoPath }) as { success: boolean; message: string };
 			showInfo(result.success ? 'Cherry-picked' : 'Cherry-pick failed', result.message);
 			if (result.success) {
 				await loadBranches();
@@ -824,12 +1449,12 @@
 	// Commit
 	// ============================
 
-	async function handleCommit(message: string) {
+	async function handleCommit(message: string, repoPath?: string) {
 		const pid = projectId;
 		if (!pid) return;
-		setGitOp(pid, 'isCommitting', true);
+		setGitOp(pid, 'isCommitting', true, repoPath);
 		try {
-			await ws.http('git:commit', { projectId: pid, message });
+			await ws.http('git:commit', { projectId: pid, message, repoPath });
 			await loadAll();
 			if (activeView === 'log') {
 				await loadLog(true);
@@ -838,7 +1463,7 @@
 			debug.error('git', 'Commit failed:', err);
 			showError('Commit Failed', err instanceof Error ? err.message : 'Unknown error');
 		} finally {
-			setGitOp(pid, 'isCommitting', false);
+			setGitOp(pid, 'isCommitting', false, repoPath);
 		}
 	}
 
@@ -1151,9 +1776,12 @@
 		markGitUiDirty();
 	}
 
-	async function viewCommitDiff(hash: string) {
+	async function viewCommitDiff(hash: string, repoPath?: string) {
 		if (!projectId) return;
-		const commit = commits.find(c => c.hash === hash);
+		const sourceCommits = repoPath
+			? (nestedCommits[branchInfo?.nested?.find(n => n.path === repoPath)?.relPath || ''] || [])
+			: commits;
+		const commit = sourceCommits.find(c => c.hash === hash);
 		if (!commit) return;
 
 		// Show the commit-detail file list in the left panel — diff tabs only
@@ -1170,7 +1798,7 @@
 		markGitUiDirty();
 
 		try {
-			const diffs = await ws.http('git:diff-commit', { projectId, commitHash: hash });
+			const diffs = await ws.http('git:diff-commit', { projectId, commitHash: hash, repoPath });
 			if (selectedCommit?.hash !== hash) return;
 			selectedCommit = { ...selectedCommit, files: diffs, isLoading: false };
 
@@ -1236,8 +1864,11 @@
 		}
 	}
 
-	function checkoutCommit(hash: string) {
-		const commit = commits.find(item => item.hash === hash);
+	function checkoutCommit(hash: string, repoPath?: string) {
+		const sourceCommits = repoPath
+			? (nestedCommits[branchInfo?.nested?.find(n => n.path === repoPath)?.relPath || ''] || [])
+			: commits;
+		const commit = sourceCommits.find(item => item.hash === hash);
 		const shortHash = commit?.hashShort ?? hash.slice(0, 7);
 		requestConfirm({
 			title: 'Checkout Commit',
@@ -1247,12 +1878,12 @@
 			onConfirm: async () => {
 				if (!projectId) return;
 				try {
-					await ws.http('git:checkout-commit', { projectId, commitHash: hash });
+					await ws.http('git:checkout-commit', { projectId, commitHash: hash, repoPath });
 					selectedCommit = null;
 					openTabs = [];
 					activeTabId = null;
 					await loadAll();
-					if (activeView === 'log') await loadLog(true);
+					await refreshAllLogs();
 					showInfo('Commit Checked Out', `Checked out ${shortHash}. HEAD is now detached.`);
 				} catch (err) {
 					debug.error('git', 'Failed to checkout commit:', err);
@@ -1271,7 +1902,8 @@
 			|| null;
 	}
 
-	function buildRemoteCommitUrl(hash: string): string | null {
+	function buildRemoteCommitUrl(hash: string, repoPath?: string): string | null {
+		if (repoPath) return null;
 		const remoteUrl = getPreferredRemoteUrl();
 		if (!remoteUrl) return null;
 
@@ -1303,10 +1935,22 @@
 		if (success) { newBranchName = ''; showCreateBranchForm = false; }
 	}
 
-	async function checkoutRemoteBranch(remoteBranch: string) {
+	async function checkoutRemoteBranch(remoteBranch: string, repoPath?: string) {
 		const parts = remoteBranch.split('/');
 		const localName = parts.slice(1).join('/');
-		await switchBranch(localName);
+		if (repoPath) {
+			if (!projectId) return;
+			try {
+				await ws.http('git:create-branch', { projectId, name: localName, startPoint: remoteBranch, repoPath });
+				showInfo('Branch Created', `Checked out "${localName}" from ${remoteBranch}.`);
+				await loadBranches();
+			} catch (err) {
+				debug.error('git', 'Failed to checkout remote branch:', err);
+				showError('Checkout Failed', err instanceof Error ? err.message : 'Unknown error');
+			}
+		} else {
+			await switchBranch(localName);
+		}
 	}
 
 	function getBranchRemote(branch: GitBranch): string | null {
@@ -1321,48 +1965,54 @@
 
 	const BRANCH_COMMIT_PAGE_SIZE = 8;
 
-	async function loadBranchCommits(branchName: string, reset = false) {
+	function branchCommitStateKey(branchName: string, repoPath?: string): string {
+		return repoPath ? `${repoPath}::${branchName}` : branchName;
+	}
+
+	async function loadBranchCommits(branchName: string, reset = false, repoPath?: string) {
 		if (!projectId) return;
-		const current = branchCommitState[branchName] ?? { commits: [], isLoading: false, hasMore: true, skip: 0 };
+		const key = branchCommitStateKey(branchName, repoPath);
+		const current = branchCommitState[key] ?? { commits: [], isLoading: false, hasMore: true, skip: 0 };
 		if (current.isLoading) return;
 		const skip = reset ? 0 : current.skip;
-		branchCommitState = { ...branchCommitState, [branchName]: { ...current, isLoading: true } };
+		branchCommitState = { ...branchCommitState, [key]: { ...current, isLoading: true } };
 		try {
-			const result = await ws.http('git:log', { projectId, branch: branchName, limit: BRANCH_COMMIT_PAGE_SIZE, skip });
-			branchCommitState = { ...branchCommitState, [branchName]: { commits: reset ? result.commits : [...current.commits, ...result.commits], isLoading: false, hasMore: result.hasMore, skip: skip + result.commits.length } };
-		} catch { branchCommitState = { ...branchCommitState, [branchName]: { ...current, isLoading: false } }; }
+			const result = await ws.http('git:log', { projectId, branch: branchName, limit: BRANCH_COMMIT_PAGE_SIZE, skip, repoPath });
+			branchCommitState = { ...branchCommitState, [key]: { commits: reset ? result.commits : [...current.commits, ...result.commits], isLoading: false, hasMore: result.hasMore, skip: skip + result.commits.length } };
+		} catch { branchCommitState = { ...branchCommitState, [key]: { ...current, isLoading: false } }; }
 	}
 
-	function toggleBranchExpanded(branchName: string) {
+	function toggleBranchExpanded(branchName: string, repoPath?: string) {
+		const key = branchCommitStateKey(branchName, repoPath);
 		const next = new Set(expandedBranches);
-		if (next.has(branchName)) { next.delete(branchName); expandedBranches = next; branchCommitState = { ...branchCommitState, [branchName]: { commits: [], isLoading: false, hasMore: true, skip: 0 } }; return; }
-		next.add(branchName); expandedBranches = next;
-		if (!branchCommitState[branchName]?.commits.length) { void loadBranchCommits(branchName, true); }
+		if (next.has(key)) { next.delete(key); expandedBranches = next; branchCommitState = { ...branchCommitState, [key]: { commits: [], isLoading: false, hasMore: true, skip: 0 } }; return; }
+		next.add(key); expandedBranches = next;
+		if (!branchCommitState[key]?.commits.length) { void loadBranchCommits(branchName, true, repoPath); }
 	}
 
-	async function loadBranchCommitFiles(hash: string) {
+	async function loadBranchCommitFiles(hash: string, repoPath?: string) {
 		if (!projectId) return;
 		const current = branchCommitFileState[hash] ?? { files: [], isLoading: false };
 		if (current.isLoading) return;
 		branchCommitFileState = { ...branchCommitFileState, [hash]: { ...current, isLoading: true } };
 		try {
-			const files = await ws.http('git:diff-commit', { projectId, commitHash: hash });
+			const files = await ws.http('git:diff-commit', { projectId, commitHash: hash, repoPath });
 			branchCommitFileState = { ...branchCommitFileState, [hash]: { files, isLoading: false } };
 		} catch { branchCommitFileState = { ...branchCommitFileState, [hash]: { ...current, isLoading: false } }; }
 	}
 
-	function toggleBranchCommitExpanded(hash: string) {
+	function toggleBranchCommitExpanded(hash: string, repoPath?: string) {
 		const next = new Set(expandedBranchCommits);
 		if (next.has(hash)) { next.delete(hash); expandedBranchCommits = next; return; }
 		next.add(hash); expandedBranchCommits = next;
-		if (!branchCommitFileState[hash]?.files.length) { void loadBranchCommitFiles(hash); }
+		if (!branchCommitFileState[hash]?.files.length) { void loadBranchCommitFiles(hash, repoPath); }
 	}
 
 	async function loadContributors() {
 		if (!projectId || isContributorsLoading) return;
 		isContributorsLoading = true;
 		try {
-		const data = await ws.http('git:log', { projectId, limit: 500, skip: 0 });
+			const data = await ws.http('git:log', { projectId, limit: 500, skip: 0 });
 			const map = new Map<string, ContributorEntry>();
 			for (const c of data.commits) {
 				// Group by email when available (one person may commit under several
@@ -1379,14 +2029,42 @@
 			contributorLog = data.commits;
 			contributorTotal = data.commits.length;
 			contributors = [...map.values()].sort((a, b) => b.count - a.count);
+
+			// Load contributors for nested subrepos
+			if (branchInfo?.nested) {
+				for (const nested of branchInfo.nested) {
+					nestedIsContributorsLoading = { ...nestedIsContributorsLoading, [nested.relPath]: true };
+					try {
+						const nestedData = await ws.http('git:log', { projectId, limit: 500, skip: 0, repoPath: nested.path });
+						const nestedMap = new Map<string, ContributorEntry>();
+						for (const c of nestedData.commits) {
+							const key = (c.authorEmail || c.author).toLowerCase().trim();
+							const existing = nestedMap.get(key);
+							if (existing) {
+								existing.count++;
+								if (c.date > existing.lastDate) existing.lastDate = c.date;
+							} else {
+								nestedMap.set(key, { key, name: c.author.trim(), email: c.authorEmail, count: 1, lastDate: c.date });
+							}
+						}
+						nestedContributorLog = { ...nestedContributorLog, [nested.relPath]: nestedData.commits };
+						nestedContributorTotal = { ...nestedContributorTotal, [nested.relPath]: nestedData.commits.length };
+						nestedContributors = { ...nestedContributors, [nested.relPath]: [...nestedMap.values()].sort((a, b) => b.count - a.count) };
+					} catch {
+						// Skip loading contributors for failed nested repos
+					} finally {
+						nestedIsContributorsLoading = { ...nestedIsContributorsLoading, [nested.relPath]: false };
+					}
+				}
+			}
 		} catch { /* ignore */ }
 		finally { isContributorsLoading = false; }
 	}
 
-	async function createBranch(name: string): Promise<boolean> {
+	async function createBranch(name: string, repoPath?: string): Promise<boolean> {
 		if (!projectId) return false;
 		try {
-			await ws.http('git:create-branch', { projectId, name });
+			await ws.http('git:create-branch', { projectId, name, repoPath });
 			showInfo('Branch Created', `Switched to "${name}".`);
 			await loadAll();
 			return true;
@@ -1429,17 +2107,37 @@
 		});
 	}
 
-	async function openMergeBranchModal() {
-		if (blockedWhileBusy('merge')) return;
-		const latestBranchInfo = await loadBranches();
-		const latestMergeableBranches = latestBranchInfo?.local.filter(branch => !branch.isCurrent) ?? [];
-		if (latestMergeableBranches.length === 0) {
-			showError('Merge Branch Unavailable', 'No other local branches are available to merge.');
-			return;
+	async function openMergeBranchModal(repoPath?: string) {
+		const isNested = Boolean(repoPath);
+		if (isNested) {
+			const nested = branchInfo?.nested?.find(n => n.path === repoPath);
+			if (!nested) return;
+			if (nested.info.operation || nested.info.detached) {
+				showError('Cannot Merge', nested.info.operation ? `A ${nested.info.operation} is in progress.` : 'HEAD is detached.');
+				return;
+			}
+			const latestMergeableBranches = nested.info.local.filter(branch => !branch.isCurrent) ?? [];
+			if (latestMergeableBranches.length === 0) {
+				showError('Merge Branch Unavailable', 'No other local branches are available to merge.');
+				return;
+			}
+			mergeRepoPath = repoPath ?? null;
+			mergeBranchName = latestMergeableBranches.find(branch => branch.name === mergeBranchName)?.name
+				?? latestMergeableBranches[0]?.name
+				?? '';
+		} else {
+			if (blockedWhileBusy('merge')) return;
+			const latestBranchInfo = await loadBranches();
+			const latestMergeableBranches = latestBranchInfo?.local.filter(branch => !branch.isCurrent) ?? [];
+			if (latestMergeableBranches.length === 0) {
+				showError('Merge Branch Unavailable', 'No other local branches are available to merge.');
+				return;
+			}
+			mergeRepoPath = null;
+			mergeBranchName = latestMergeableBranches.find(branch => branch.name === mergeBranchName)?.name
+				?? latestMergeableBranches[0]?.name
+				?? '';
 		}
-		mergeBranchName = latestMergeableBranches.find(branch => branch.name === mergeBranchName)?.name
-			?? latestMergeableBranches[0]?.name
-			?? '';
 		mergeMode = 'default';
 		showMergeBranchModal = true;
 	}
@@ -1447,19 +2145,23 @@
 	function closeMergeBranchModal() {
 		showMergeBranchModal = false;
 		mergeMode = 'default';
+		mergeRepoPath = null;
 	}
 
 	async function runMergeBranch(name: string, noFastForward = false) {
-		if (!projectId || !name || isMoreBusy) return;
-		if (blockedWhileBusy('merge')) return;
+		if (!projectId || !name) return;
+		const isNested = Boolean(mergeRepoPath);
+		const isBusy = getGitOps(projectId, mergeRepoPath ?? undefined).isMoreBusy;
+		if (isBusy) return;
+		if (!isNested && blockedWhileBusy('merge')) return;
 
-		const targetBranch = branchInfo?.current;
 		await runMore(async () => {
 			try {
 				const result = await ws.http('git:merge-branch', {
 					projectId,
 					branchName: name,
-					noFastForward
+					noFastForward,
+					...(mergeRepoPath && { repoPath: mergeRepoPath })
 				});
 				showMergeBranchModal = false;
 
@@ -1475,14 +2177,14 @@
 					await loadAll();
 					showInfo(
 						'Merge Complete',
-						`Merged "${name}" into "${targetBranch ?? 'current branch'}"${noFastForward ? ' with --no-ff' : ''}.`
+						`Merged "${name}" into "${mergeTargetBranch}"${noFastForward ? ' with --no-ff' : ''}.`
 					);
 				}
 			} catch (err) {
 				debug.error('git', 'Failed to merge branch:', err);
 				showError('Merge Failed', err instanceof Error ? err.message : 'Unknown error');
 			}
-		});
+		}, mergeRepoPath ?? undefined);
 	}
 
 	function mergeBranch(name: string) {
@@ -1505,43 +2207,65 @@
 	const isPushing = $derived(ops.isPushing);
 	const isMoreBusy = $derived(ops.isMoreBusy);
 
-	async function handleFetch() {
+	async function handleFetch(repoPath?: string, remote?: string) {
 		const pid = projectId;
-		if (!pid || isFetching) return;
-		setGitOp(pid, 'isFetching', true);
+		if (!pid || getGitOps(pid, repoPath).isFetching) return;
+		if (!repoPath && blockedWhileBusy('fetch')) return;
+		setGitOp(pid, 'isFetching', true, repoPath);
 		try {
-			const prevAhead = branchInfo?.ahead ?? 0;
-			const prevBehind = branchInfo?.behind ?? 0;
-			await ws.http('git:fetch', { projectId: pid, remote: selectedRemote });
+			const info = repoPath ? branchInfo?.nested?.find(n => n.path === repoPath)?.info : branchInfo;
+			const prevAhead = info?.ahead ?? 0;
+			const prevBehind = info?.behind ?? 0;
+			let useRemote = remote;
+			if (!useRemote) {
+				if (repoPath && branchInfo?.nested) {
+					const nested = branchInfo.nested.find(n => n.path === repoPath);
+					useRemote = nested ? getNestedSelectedRemote(nested) : 'origin';
+				} else {
+					useRemote = selectedRemote;
+				}
+			}
+			await ws.http('git:fetch', { projectId: pid, remote: useRemote, repoPath });
 			await loadBranches();
-			const newAhead = branchInfo?.ahead ?? 0;
-			const newBehind = branchInfo?.behind ?? 0;
+			const updatedInfo = repoPath ? branchInfo?.nested?.find(n => n.path === repoPath)?.info : branchInfo;
+			const newAhead = updatedInfo?.ahead ?? 0;
+			const newBehind = updatedInfo?.behind ?? 0;
 			const parts: string[] = [];
 			if (newAhead > 0) parts.push(`${newAhead} ahead`);
 			if (newBehind > 0) parts.push(`${newBehind} behind`);
 			if (parts.length > 0) {
-				showInfo('Fetch Complete', `Your branch is ${parts.join(', ')} ${selectedRemote}.`);
+				showInfo('Fetch Complete', `Your branch is ${parts.join(', ')} ${useRemote}.`);
 			} else if (prevBehind > 0 || prevAhead > 0) {
-				showInfo('Fetch Complete', `In sync with ${selectedRemote}.`);
+				showInfo('Fetch Complete', `In sync with ${useRemote}.`);
 			} else {
-				showInfo('Fetch Complete', `Already up to date with ${selectedRemote}.`);
+				showInfo('Fetch Complete', `Already up to date with ${useRemote}.`);
 			}
 		} catch (err) {
 			debug.error('git', 'Fetch failed:', err);
 			showError('Fetch Failed', err instanceof Error ? err.message : 'Unknown error');
 		} finally {
-			setGitOp(pid, 'isFetching', false);
+			setGitOp(pid, 'isFetching', false, repoPath);
 		}
 	}
 
-	async function handlePull() {
+	async function handlePull(repoPath?: string, remote?: string) {
 		const pid = projectId;
-		if (!pid || isPulling) return;
-		if (blockedWhileBusy('pull')) return;
-		setGitOp(pid, 'isPulling', true);
+		if (!pid || getGitOps(pid, repoPath).isPulling) return;
+		if (!repoPath && blockedWhileBusy('pull')) return;
+		setGitOp(pid, 'isPulling', true, repoPath);
 		try {
-			const prevBehind = branchInfo?.behind ?? 0;
-			const result = await ws.http('git:pull', { projectId: pid, remote: selectedRemote, branch: branchInfo?.current });
+			const info = repoPath ? branchInfo?.nested?.find(n => n.path === repoPath)?.info : branchInfo;
+			const prevBehind = info?.behind ?? 0;
+			let useRemote = remote;
+			if (!useRemote) {
+				if (repoPath && branchInfo?.nested) {
+					const nested = branchInfo.nested.find(n => n.path === repoPath);
+					useRemote = nested ? getNestedSelectedRemote(nested) : 'origin';
+				} else {
+					useRemote = selectedRemote;
+				}
+			}
+			const result = await ws.http('git:pull', { projectId: pid, remote: useRemote, branch: info?.current, repoPath });
 			if (!result.success) {
 				if (result.message.includes('conflict')) {
 					await loadAll();
@@ -1553,42 +2277,52 @@
 			} else {
 				await loadAll();
 				if (prevBehind > 0) {
-					showInfo('Pull Complete', `Pulled ${prevBehind} commit${prevBehind > 1 ? 's' : ''} from ${selectedRemote}.`);
+					showInfo('Pull Complete', `Pulled ${prevBehind} commit${prevBehind > 1 ? 's' : ''} from ${useRemote}.`);
 				} else {
-					showInfo('Pull Complete', `Already up to date with ${selectedRemote}.`);
+					showInfo('Pull Complete', `Already up to date with ${useRemote}.`);
 				}
 			}
 		} catch (err) {
 			debug.error('git', 'Pull failed:', err);
 			showError('Pull Failed', err instanceof Error ? err.message : 'Unknown error');
 		} finally {
-			setGitOp(pid, 'isPulling', false);
+			setGitOp(pid, 'isPulling', false, repoPath);
 		}
 	}
 
-	async function handlePush() {
+	async function handlePush(repoPath?: string, remote?: string) {
 		const pid = projectId;
-		if (!pid || isPushing) return;
-		if (blockedWhileBusy('push')) return;
-		setGitOp(pid, 'isPushing', true);
+		if (!pid || getGitOps(pid, repoPath).isPushing) return;
+		if (!repoPath && blockedWhileBusy('push')) return;
+		setGitOp(pid, 'isPushing', true, repoPath);
 		try {
-			const prevAhead = branchInfo?.ahead ?? 0;
-			const result = await ws.http('git:push', { projectId: pid, remote: selectedRemote, branch: branchInfo?.current });
+			const info = repoPath ? branchInfo?.nested?.find(n => n.path === repoPath)?.info : branchInfo;
+			const prevAhead = info?.ahead ?? 0;
+			let useRemote = remote;
+			if (!useRemote) {
+				if (repoPath && branchInfo?.nested) {
+					const nested = branchInfo.nested.find(n => n.path === repoPath);
+					useRemote = nested ? getNestedSelectedRemote(nested) : 'origin';
+				} else {
+					useRemote = selectedRemote;
+				}
+			}
+			const result = await ws.http('git:push', { projectId: pid, remote: useRemote, branch: info?.current, repoPath });
 			if (!result.success) {
 				showError('Push Failed', result.message);
 			} else {
 				await loadBranches();
 				if (prevAhead > 0) {
-					showInfo('Push Complete', `Pushed ${prevAhead} commit${prevAhead > 1 ? 's' : ''} to ${selectedRemote}.`);
+					showInfo('Push Complete', `Pushed ${prevAhead} commit${prevAhead > 1 ? 's' : ''} to ${useRemote}.`);
 				} else {
-					showInfo('Push Complete', `Branch pushed to ${selectedRemote}.`);
+					showInfo('Push Complete', `Branch pushed to ${useRemote}.`);
 				}
 			}
 		} catch (err) {
 			debug.error('git', 'Push failed:', err);
 			showError('Push Failed', err instanceof Error ? err.message : 'Unknown error');
 		} finally {
-			setGitOp(pid, 'isPushing', false);
+			setGitOp(pid, 'isPushing', false, repoPath);
 		}
 	}
 
@@ -1596,50 +2330,70 @@
 	// More Git Actions (push variants, undo, npm version, maintenance)
 	// ============================
 
-	async function runMore(fn: () => Promise<void>) {
+	async function runMore(fn: () => Promise<void>, repoPath?: string) {
 		const pid = projectId;
-		if (!pid || isMoreBusy) return;
-		setGitOp(pid, 'isMoreBusy', true);
+		if (!pid || getGitOps(pid, repoPath).isMoreBusy) return;
+		setGitOp(pid, 'isMoreBusy', true, repoPath);
 		try {
 			await fn();
 		} finally {
-			setGitOp(pid, 'isMoreBusy', false);
+			setGitOp(pid, 'isMoreBusy', false, repoPath);
 		}
 	}
 
-	async function pushVariant(mode: 'with-tags' | 'all-tags' | 'force-lease' | 'force', label: string) {
-		if (blockedWhileBusy('push')) return;
+	async function pushVariant(mode: 'with-tags' | 'all-tags' | 'force-lease' | 'force', label: string, repoPath?: string, branch?: string, remote?: string) {
+		if (!repoPath && blockedWhileBusy('push')) return;
 		await runMore(async () => {
 			try {
+				let useRemote = remote;
+				if (!useRemote) {
+					if (repoPath && branchInfo?.nested) {
+						const nested = branchInfo.nested.find(n => n.path === repoPath);
+						useRemote = nested ? getNestedSelectedRemote(nested) : 'origin';
+					} else {
+						useRemote = selectedRemote;
+					}
+				}
 				const result = await ws.http('git:push-advanced', {
 					projectId,
 					mode,
-					remote: selectedRemote,
-					branch: branchInfo?.current
+					remote: useRemote,
+					branch: branch ?? branchInfo?.current,
+					repoPath
 				});
 				if (!result.success) {
 					showError('Push Failed', result.message);
 				} else {
 					await loadBranches();
 					await loadTags();
-					showInfo('Push Complete', `${label} to ${selectedRemote}.`);
+					showInfo('Push Complete', `${label} to ${useRemote}.`);
 				}
 			} catch (err) {
 				debug.error('git', 'Push variant failed:', err);
 				showError('Push Failed', err instanceof Error ? err.message : 'Unknown error');
 			}
-		});
+		}, repoPath);
 	}
 
-	async function pullRebase() {
-		if (blockedWhileBusy('pull with rebase')) return;
+	async function pullRebase(repoPath?: string, branch?: string, remote?: string) {
+		if (!repoPath && blockedWhileBusy('pull with rebase')) return;
 		await runMore(async () => {
 			try {
+				let useRemote = remote;
+				if (!useRemote) {
+					if (repoPath && branchInfo?.nested) {
+						const nested = branchInfo.nested.find(n => n.path === repoPath);
+						useRemote = nested ? getNestedSelectedRemote(nested) : 'origin';
+					} else {
+						useRemote = selectedRemote;
+					}
+				}
 				const result = await ws.http('git:pull', {
 					projectId,
-					remote: selectedRemote,
-					branch: branchInfo?.current,
-					rebase: true
+					remote: useRemote,
+					branch: branch ?? branchInfo?.current,
+					rebase: true,
+					repoPath
 				});
 				if (!result.success) {
 					if (result.message.includes('conflict')) {
@@ -1651,19 +2405,19 @@
 					}
 				} else {
 					await loadAll();
-					showInfo('Pull Complete', `Rebased onto ${selectedRemote}.`);
+					showInfo('Pull Complete', `Rebased onto ${useRemote}.`);
 				}
 			} catch (err) {
 				debug.error('git', 'Pull (rebase) failed:', err);
 				showError('Pull Failed', err instanceof Error ? err.message : 'Unknown error');
 			}
-		});
+		}, repoPath);
 	}
 
-	async function fetchAll() {
+	async function fetchAll(repoPath?: string) {
 		await runMore(async () => {
 			try {
-				await ws.http('git:fetch-all', { projectId });
+				await ws.http('git:fetch-all', { projectId, repoPath });
 				await loadBranches();
 				await loadTags();
 				showInfo('Fetch Complete', 'Fetched all remotes and pruned stale branches.');
@@ -1671,13 +2425,13 @@
 				debug.error('git', 'Fetch all failed:', err);
 				showError('Fetch Failed', err instanceof Error ? err.message : 'Unknown error');
 			}
-		});
+		}, repoPath);
 	}
 
-	async function undoCommit(mode: 'soft' | 'mixed' | 'hard') {
+	async function undoCommit(mode: 'soft' | 'mixed' | 'hard', repoPath?: string) {
 		await runMore(async () => {
 			try {
-				await ws.http('git:undo-commit', { projectId, mode });
+				await ws.http('git:undo-commit', { projectId, mode, repoPath });
 				await loadAll();
 				if (activeView === 'log') await loadLog(true);
 				const detail =
@@ -1691,13 +2445,62 @@
 				debug.error('git', 'Undo commit failed:', err);
 				showError('Undo Failed', err instanceof Error ? err.message : 'Unknown error');
 			}
-		});
+		}, repoPath);
 	}
 
-	async function revertLast() {
+	// Undo the HEAD commit of the current branch from the branch list.
+	// Soft-reset keeps the changes staged and restores the commit message
+	// into the draft input so the user can tweak and re-commit. If the
+	// branch is already pushed (ahead === 0 on a tracked branch), warn that
+	// a force push will be needed to update the remote afterwards.
+	async function handleUndoHeadCommit(commit: GitCommit, branch: GitBranch, repoPath?: string) {
+		const info = repoPath
+			? branchInfo?.nested?.find(n => n.path === repoPath)?.info
+			: branchInfo;
+		const pushed = info ? pushedBranchNamesFromInfo(info) : pushedBranchNames;
+		const isPushed = pushed.has(branch.name) && branch.ahead === 0;
+		const branchKey = branchCommitStateKey(branch.name, repoPath);
+		const doUndo = async () => {
+			await runMore(async () => {
+				try {
+					await ws.http('git:undo-commit', { projectId, mode: 'soft', repoPath });
+					gitDraft.commitMessage = commit.message;
+					await loadAll();
+					if (branchCommitState[branchKey]) {
+						branchCommitState = {
+							...branchCommitState,
+							[branchKey]: { commits: [], isLoading: false, hasMore: true, skip: 0 }
+						};
+						await loadBranchCommits(branch.name, true, repoPath);
+					}
+					if (activeView === 'log') await loadLog(true);
+					showInfo(
+						'Commit Undone',
+						'Changes kept staged. Commit message restored to the input — edit and re-commit when ready.'
+					);
+				} catch (err) {
+					debug.error('git', 'Undo HEAD commit failed:', err);
+					showError('Undo Failed', err instanceof Error ? err.message : 'Unknown error');
+				}
+			}, repoPath);
+		};
+		if (isPushed) {
+			requestConfirm({
+				title: 'Undo Pushed Commit',
+				message: `This commit has been pushed to the remote. Undoing it locally will diverge "${branch.name}" from the remote — you'll need to force push to update it later. Continue?`,
+				type: 'warning',
+				confirmText: 'Undo & Force Push Later',
+				onConfirm: () => void doUndo()
+			});
+		} else {
+			void doUndo();
+		}
+	}
+
+	async function revertLast(repoPath?: string) {
 		await runMore(async () => {
 			try {
-				const result = await ws.http('git:revert', { projectId });
+				const result = await ws.http('git:revert', { projectId, repoPath });
 				if (!result.success) {
 					if (gitStatus.conflicted.length > 0 || result.message.includes('conflict')) {
 						await loadAll();
@@ -1715,13 +2518,13 @@
 				debug.error('git', 'Revert failed:', err);
 				showError('Revert Failed', err instanceof Error ? err.message : 'Unknown error');
 			}
-		});
+		}, repoPath);
 	}
 
-	async function npmVersion(bump: 'patch' | 'minor' | 'major') {
+	async function npmVersion(bump: 'patch' | 'minor' | 'major', repoPath?: string) {
 		await runMore(async () => {
 			try {
-				const result = await ws.http('git:npm-version', { projectId, bump });
+				const result = await ws.http('git:npm-version', { projectId, bump, repoPath });
 				if (!result.success) {
 					showError('npm version Failed', result.message);
 				} else {
@@ -1733,32 +2536,104 @@
 				debug.error('git', 'npm version failed:', err);
 				showError('npm version Failed', err instanceof Error ? err.message : 'Unknown error');
 			}
-		});
+		}, repoPath);
 	}
 
-	async function cleanUntracked() {
+	async function cleanUntracked(repoPath?: string) {
 		await runMore(async () => {
 			try {
-				await ws.http('git:clean', { projectId });
+				await ws.http('git:clean', { projectId, repoPath });
 				await loadStatus();
 				showInfo('Clean Complete', 'Removed untracked files.');
 			} catch (err) {
 				debug.error('git', 'Clean failed:', err);
 				showError('Clean Failed', err instanceof Error ? err.message : 'Unknown error');
 			}
-		});
+		}, repoPath);
 	}
 
-	async function optimizeRepo() {
+	async function optimizeRepo(repoPath?: string) {
 		await runMore(async () => {
 			try {
-				await ws.http('git:gc', { projectId });
+				await ws.http('git:gc', { projectId, repoPath });
 				showInfo('Optimized', 'Repository garbage collection complete.');
 			} catch (err) {
 				debug.error('git', 'Optimize failed:', err);
 				showError('Optimize Failed', err instanceof Error ? err.message : 'Unknown error');
 			}
-		});
+		}, repoPath);
+	}
+
+	function handleNestedMoreAction(action: GitMoreAction, repoPath: string) {
+		const nested = branchInfo?.nested?.find(n => n.path === repoPath);
+		if (!nested) return;
+		const info = nested.info;
+		const subRemote = getNestedSelectedRemote(nested);
+
+		switch (action) {
+			case 'merge-branch':
+				return void openMergeBranchModal(repoPath);
+			case 'push-follow-tags':
+				return void pushVariant('with-tags', 'Pushed branch with tags', repoPath, info.current, subRemote);
+			case 'push-all-tags':
+				return void pushVariant('all-tags', 'Pushed all tags', repoPath, info.current, subRemote);
+			case 'push-force-lease':
+				return requestConfirm({
+					title: 'Force Push (with lease)',
+					message: `Force push "${info.current}" to ${subRemote}? This overwrites the remote branch but aborts if someone else has pushed.`,
+					type: 'warning',
+					confirmText: 'Force Push',
+					onConfirm: () => void pushVariant('force-lease', 'Force-pushed branch', repoPath, info.current, subRemote)
+				});
+			case 'push-force':
+				return requestConfirm({
+					title: 'Force Push',
+					message: `Force push "${info.current}" to ${subRemote}? This unconditionally overwrites the remote branch and can destroy others' commits.`,
+					type: 'error',
+					confirmText: 'Force Push',
+					onConfirm: () => void pushVariant('force', 'Force-pushed branch', repoPath, info.current, subRemote)
+				});
+			case 'pull-rebase':
+				return void pullRebase(repoPath, info.current, subRemote);
+			case 'fetch-all':
+				return void fetchAll(repoPath);
+			case 'undo-soft':
+				return void undoCommit('soft', repoPath);
+			case 'undo-mixed':
+				return void undoCommit('mixed', repoPath);
+			case 'undo-hard':
+				return requestConfirm({
+					title: 'Undo Last Commit (discard)',
+					message: 'Undo the last commit and discard all its changes? This cannot be undone.',
+					type: 'error',
+					confirmText: 'Discard',
+					onConfirm: () => void undoCommit('hard', repoPath)
+				});
+			case 'revert-last':
+				return void revertLast(repoPath);
+			case 'npm-patch':
+			case 'npm-minor':
+			case 'npm-major': {
+				const bump = action.replace('npm-', '') as 'patch' | 'minor' | 'major';
+				return requestConfirm({
+					title: `npm version ${bump}`,
+					message: `Bump the package version (${bump}) and create a version commit and tag? Requires a clean working tree.`,
+					type: 'info',
+					confirmText: 'Bump Version',
+					onConfirm: () => void npmVersion(bump, repoPath)
+				});
+			}
+			case 'clean-untracked':
+				return requestConfirm({
+					title: 'Clean Untracked Files',
+					message: 'Permanently delete all untracked files and directories? This cannot be undone.',
+					type: 'error',
+					confirmText: 'Clean',
+					onConfirm: () => void cleanUntracked(repoPath)
+				});
+			case 'gc':
+				return void optimizeRepo(repoPath);
+		}
 	}
 
 	function handleMoreAction(action: GitMoreAction) {
@@ -1916,7 +2791,15 @@ ${bodies}`;
 			onConfirm: async () => {
 				if (!projectId) return;
 				try {
-					await ws.http('git:abort-merge', { projectId });
+					let targetRepoPath: string | undefined = undefined;
+					const anyConflictFile = conflictFiles[0]?.path || conflictInitialPath;
+					if (anyConflictFile && branchInfo?.nested) {
+						const matchingNested = branchInfo.nested.find(n => anyConflictFile.startsWith(n.relPath + '/'));
+						if (matchingNested) {
+							targetRepoPath = matchingNested.path;
+						}
+					}
+					await ws.http('git:abort-merge', { projectId, repoPath: targetRepoPath });
 					showConflictResolver = false;
 					await loadAll();
 				} catch (err) {
@@ -1941,7 +2824,24 @@ ${bodies}`;
 		if (!projectId) return;
 		isStashLoading = true;
 		try {
-			stashEntries = await ws.http('git:stash-list', { projectId });
+			const mainStashes = await ws.http('git:stash-list', { projectId }) as GitStashEntry[];
+			const allStashes: StashEntryExtended[] = mainStashes.map(s => ({ ...s }));
+
+			if (branchInfo?.nested) {
+				for (const nested of branchInfo.nested) {
+					try {
+						const nestedStashes = await ws.http('git:stash-list', { projectId, repoPath: nested.path }) as GitStashEntry[];
+						allStashes.push(...nestedStashes.map(s => ({
+							...s,
+							repoPath: nested.path,
+							repoRelPath: nested.relPath
+						})));
+					} catch {
+						// Skip loading stash for failed nested repos
+					}
+				}
+			}
+			stashEntries = allStashes;
 		} catch (err) {
 			debug.error('git', 'Failed to load stash list:', err);
 		} finally {
@@ -1955,11 +2855,13 @@ ${bodies}`;
 			await ws.http('git:stash-save', {
 				projectId,
 				message: stashMessage.trim() || undefined,
-				staged: stashStagedOnly
+				staged: stashStagedOnly,
+				repoPath: stashRepoPath
 			});
 			stashMessage = '';
 			showStashSaveForm = false;
 			stashStagedOnly = false;
+			stashRepoPath = undefined;
 			await Promise.all([loadStash(), loadStatus()]);
 		} catch (err) {
 			debug.error('git', 'Stash save failed:', err);
@@ -1973,9 +2875,10 @@ ${bodies}`;
 	 * scope, and focuses the message input so the user can type a description
 	 * and submit.
 	 */
-	function openStashPrompt(scope: 'all' | 'staged' = 'all') {
+	function openStashPrompt(scope: 'all' | 'staged' = 'all', repoPath?: string) {
 		stashMessage = '';
 		stashStagedOnly = scope === 'staged';
+		stashRepoPath = repoPath;
 		showStashSaveForm = true;
 		moreSubTab = 'stash';
 		switchToView('more');
@@ -1991,10 +2894,14 @@ ${bodies}`;
 		});
 	}
 
-	async function handleStashPop(index: number) {
+	function getStashKey(entry: StashEntryExtended): string {
+		return entry.repoPath ? `${entry.repoPath}::${entry.index}` : `${entry.index}`;
+	}
+
+	async function handleStashPop(entry: StashEntryExtended) {
 		if (!projectId) return;
 		try {
-			const result = await ws.http('git:stash-pop', { projectId, index });
+			const result = await ws.http('git:stash-pop', { projectId, index: entry.index, repoPath: entry.repoPath });
 			await Promise.all([loadStash(), loadStatus()]);
 			if (!result.success && result.hasConflicts) {
 				await loadConflicts();
@@ -2015,16 +2922,17 @@ ${bodies}`;
 		}
 	}
 
-	async function handleStashDrop(index: number) {
+	async function handleStashDrop(entry: StashEntryExtended) {
+		const stashName = entry.repoRelPath ? `${entry.repoRelPath} stash@{${entry.index}}` : `stash@{${entry.index}}`;
 		requestConfirm({
 			title: 'Drop Stash',
-			message: `Drop stash@{${index}}? This cannot be undone.`,
+			message: `Drop ${stashName}? This cannot be undone.`,
 			type: 'error',
 			confirmText: 'Drop',
 			onConfirm: async () => {
 				if (!projectId) return;
 				try {
-					await ws.http('git:stash-drop', { projectId, index });
+					await ws.http('git:stash-drop', { projectId, index: entry.index, repoPath: entry.repoPath });
 					await loadStash();
 				} catch (err) {
 					debug.error('git', 'Stash drop failed:', err);
@@ -2057,35 +2965,38 @@ ${bodies}`;
 		return `${Math.floor(diffDays / 365)}y ago`;
 	}
 
-	async function loadStashFiles(index: number) {
+	async function loadStashFiles(entry: StashEntryExtended) {
 		if (!projectId) return;
-		stashFileState = { ...stashFileState, [index]: { files: stashFileState[index]?.files ?? [], isLoading: true } };
+		const key = getStashKey(entry);
+		stashFileState = { ...stashFileState, [key]: { files: stashFileState[key]?.files ?? [], isLoading: true } };
 		try {
-			const diffs = await ws.http('git:stash-diff', { projectId, index });
-			stashFileState = { ...stashFileState, [index]: { files: diffs, isLoading: false } };
+			const diffs = await ws.http('git:stash-diff', { projectId, index: entry.index, repoPath: entry.repoPath });
+			stashFileState = { ...stashFileState, [key]: { files: diffs, isLoading: false } };
 		} catch (err) {
 			debug.error('git', 'Failed to load stash diff:', err);
-			stashFileState = { ...stashFileState, [index]: { files: [], isLoading: false } };
+			stashFileState = { ...stashFileState, [key]: { files: [], isLoading: false } };
 		}
 	}
 
-	function toggleStashExpanded(index: number) {
+	function toggleStashExpanded(entry: StashEntryExtended) {
+		const key = getStashKey(entry);
 		const next = new Set(expandedStashes);
-		if (next.has(index)) {
-			next.delete(index);
+		if (next.has(key)) {
+			next.delete(key);
 		} else {
-			next.add(index);
-			if (!stashFileState[index]?.files.length) void loadStashFiles(index);
+			next.add(key);
+			if (!stashFileState[key]?.files.length) void loadStashFiles(entry);
 		}
 		expandedStashes = next;
 	}
 
 	/** Open a single file from a stash in the diff editor. */
-	function viewStashFileDiff(file: GitFileDiff, index: number) {
+	function viewStashFileDiff(file: GitFileDiff, entry: StashEntryExtended) {
 		const path = file.newPath || file.oldPath;
 		if (!path) return;
 		const fileName = path.split(/[\\/]/).pop() || path;
-		const tabId = `stash:${index}:${path}`;
+		const key = getStashKey(entry);
+		const tabId = `stash:${key}:${path}`;
 		openTabs = [{
 			id: tabId,
 			filePath: path,
@@ -2109,7 +3020,24 @@ ${bodies}`;
 		if (!projectId) return;
 		isTagsLoading = true;
 		try {
-			tags = await ws.http('git:tags', { projectId });
+			const mainTags = await ws.http('git:tags', { projectId }) as GitTag[];
+			const allTags: TagExtended[] = mainTags.map(t => ({ ...t }));
+
+			if (branchInfo?.nested) {
+				for (const nested of branchInfo.nested) {
+					try {
+						const nestedTags = await ws.http('git:tags', { projectId, repoPath: nested.path }) as GitTag[];
+						allTags.push(...nestedTags.map(t => ({
+							...t,
+							repoPath: nested.path,
+							repoRelPath: nested.relPath
+						})));
+					} catch {
+						// Skip loading tags for failed nested repos
+					}
+				}
+			}
+			tags = allTags;
 		} catch (err) {
 			debug.error('git', 'Failed to load tags:', err);
 		} finally {
@@ -2123,11 +3051,13 @@ ${bodies}`;
 			await ws.http('git:create-tag', {
 				projectId,
 				name: newTagName.trim(),
-				message: newTagMessage.trim() || undefined
+				message: newTagMessage.trim() || undefined,
+				repoPath: tagRepoPath
 			});
 			newTagName = '';
 			newTagMessage = '';
 			showCreateTagForm = false;
+			tagRepoPath = undefined;
 			await loadTags();
 		} catch (err) {
 			debug.error('git', 'Create tag failed:', err);
@@ -2135,16 +3065,17 @@ ${bodies}`;
 		}
 	}
 
-	async function handleDeleteTag(name: string) {
+	async function handleDeleteTag(name: string, repoPath?: string) {
+		const label = repoPath ? `tag "${name}" in submodule?` : `tag "${name}"?`;
 		requestConfirm({
 			title: 'Delete Tag',
-			message: `Delete tag "${name}"?`,
+			message: `Delete ${label}`,
 			type: 'error',
 			confirmText: 'Delete',
 			onConfirm: async () => {
 				if (!projectId) return;
 				try {
-					await ws.http('git:delete-tag', { projectId, name });
+					await ws.http('git:delete-tag', { projectId, name, repoPath });
 					await loadTags();
 				} catch (err) {
 					debug.error('git', 'Delete tag failed:', err);
@@ -2154,14 +3085,14 @@ ${bodies}`;
 		});
 	}
 
-	async function handlePushTag(name: string) {
+	async function handlePushTag(name: string, repoPath?: string) {
 		if (!projectId) return;
 		try {
-			const result = await ws.http('git:push-tag', { projectId, name });
+			const result = await ws.http('git:push-tag', { projectId, name, repoPath });
 			if (!result.success) {
 				showError('Push Tag Failed', result.message);
 			} else {
-				showInfo('Tag Pushed', `Tag "${name}" pushed to remote.`);
+				showInfo('Tag Pushed', `Successfully pushed tag "${name}" to remote.`);
 			}
 		} catch (err) {
 			debug.error('git', 'Push tag failed:', err);
@@ -2213,6 +3144,8 @@ ${bodies}`;
 						selectedRemote = restored.selectedRemote;
 						pendingSelectedCommitHash = restored.selectedCommitHash;
 						pendingActiveDiff = restored.activeDiff;
+						nestedReposHeight = restored.nestedReposHeight ?? 300;
+						nestedReposHeights = restored.nestedReposHeights ?? {};
 					} else {
 						activeView = 'changes';
 						selectedRemote = 'origin';
@@ -2258,7 +3191,9 @@ ${bodies}`;
 					commitHash: activeTab.commitHash,
 					scrollTop: activeDiffScrollTop()
 				}
-				: null
+				: null,
+			nestedReposHeight,
+			nestedReposHeights: $state.snapshot(nestedReposHeights)
 		});
 		setGitSnapshotProvider(provider);
 		return () => {
@@ -2389,7 +3324,7 @@ ${bodies}`;
 			loadContributors();
 			// Refresh log if it was already loaded (History tab was visited)
 			if (commits.length > 0) {
-				loadLog(true);
+				refreshAllLogs();
 			}
 		});
 
@@ -2436,6 +3371,26 @@ ${bodies}`;
 	// Combined unstaged + untracked
 	const allChanges = $derived([...gitStatus.unstaged, ...gitStatus.untracked]);
 
+	// Nested repo path prefixes — used to separate main-repo files from subrepo files
+	const nestedRepoPrefixes = $derived(
+		(branchInfo?.nested ?? []).map(n => n.relPath + '/')
+	);
+
+	function isNestedFile(filePath: string): boolean {
+		return nestedRepoPrefixes.some(prefix => filePath.startsWith(prefix));
+	}
+
+	// Main-repo only (excludes nested subrepo files)
+	const mainStagedFiles = $derived(gitStatus.staged.filter(f => !isNestedFile(f.path)));
+	const mainAllChanges = $derived(allChanges.filter(f => !isNestedFile(f.path)));
+	const mainConflictedFiles = $derived(gitStatus.conflicted.filter(f => !isNestedFile(f.path)));
+
+	// Per nested repo files (filtered by their relPath prefix, paths stripped of prefix)
+	function nestedRepoFiles(relPath: string, files: GitFileChange[]): GitFileChange[] {
+		const prefix = relPath + '/';
+		return files.filter(f => f.path.startsWith(prefix));
+	}
+
 	// Total changes count
 	const totalChanges = $derived(
 		gitStatus.staged.length + allChanges.length + gitStatus.conflicted.length
@@ -2463,6 +3418,923 @@ ${bodies}`;
 		isTwoColumnMode: () => isTwoColumnMode
 	};
 </script>
+
+<!-- Nested repo branch row snippet (mirrors main branch row) -->
+{#snippet nestedRepoBranchRow(nested: GitNestedRepoInfo, branch: GitBranch)}
+	{@const upstreamName = getBranchRemoteName(branch)}
+	{@const branchKey = branchCommitStateKey(branch.name, nested.path)}
+	{@const isExpanded = expandedBranches.has(branchKey)}
+	{@const commitState = branchCommitState[branchKey]}
+	{@const branchRelativeDate = formatRelativeTime(branch.lastCommitDate)}
+	{@const nestedPushed = nestedPushedBranchNames(nested)}
+	<div>
+		<div
+			class="group relative flex items-center gap-1.5 pl-1.5 pr-2.5 py-1.5 rounded-md transition-colors border cursor-pointer select-none {branch.isCurrent ? 'bg-violet-500/10 border-violet-500/20 text-violet-700 dark:text-violet-300' : 'border-transparent hover:bg-slate-100 dark:hover:bg-slate-800/60 text-slate-700 dark:text-slate-300'}"
+			role="button"
+			tabindex="0"
+			onclick={() => toggleBranchExpanded(branch.name, nested.path)}
+			onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleBranchExpanded(branch.name, nested.path); } }}
+		>
+			<Icon name={isExpanded ? 'lucide:chevron-down' : 'lucide:chevron-right'} class="w-3.5 h-3.5 shrink-0 {branch.isCurrent ? 'text-violet-500' : 'text-slate-400'}" />
+			<div class="flex-1 min-w-0 flex flex-col justify-center overflow-hidden pr-2 {!branch.isCurrent ? (nestedPushed.has(branch.name) ? 'group-hover:pr-24' : 'group-hover:pr-32') : ''} transition-[padding] duration-150">
+				<div class="flex min-w-0 items-center gap-2">
+					<span class="flex-1 min-w-0 text-sm text-slate-900 dark:text-slate-100 leading-tight truncate" title={branch.name}>{branch.name}</span>
+					{#if upstreamName}<span class="text-3xs text-slate-400 shrink-0">{upstreamName}</span>{/if}
+				</div>
+				<div class="flex min-w-0 items-center gap-1.5 mt-0.5 text-xs text-slate-500 leading-tight">
+					{#if branch.ahead > 0}<span class="shrink-0">{branch.ahead} ahead</span>{/if}
+					{#if branch.behind > 0}<span class="shrink-0">{branch.behind} behind</span>{/if}
+					{#if branch.lastCommit}<span class="min-w-0 truncate">{branch.lastCommit}</span>{/if}
+					{#if branchRelativeDate}<span class="shrink-0 whitespace-nowrap">·&nbsp;{branchRelativeDate}</span>{/if}
+				</div>
+			</div>
+			{#if !branch.isCurrent}
+			<div class="pointer-events-none absolute inset-y-0 right-0 flex items-center gap-1 pl-1 pr-2 bg-white/20 opacity-0 backdrop-blur-md supports-[backdrop-filter]:bg-white/10 transition-opacity group-hover:opacity-100 dark:bg-slate-900/20 dark:supports-[backdrop-filter]:bg-slate-900/10">
+				<button type="button" class="pointer-events-auto flex items-center justify-center w-7 h-7 rounded-md text-slate-400 hover:bg-violet-500/10 hover:text-violet-500 transition-colors bg-transparent border-none cursor-pointer" onclick={(e) => { e.stopPropagation(); handleSwitchNestedBranch(nested, branch.name); }} title="Switch to this branch"><Icon name="lucide:arrow-right" class="w-3.5 h-3.5" /></button>
+				{#if !nestedPushed.has(branch.name)}
+					{#if pushingBranch === branch.name}
+						<div class="pointer-events-auto flex items-center justify-center w-7 h-7 rounded-md text-emerald-500"><Icon name="lucide:loader-circle" class="w-3.5 h-3.5 animate-spin" /></div>
+					{:else}
+						<button type="button" class="pointer-events-auto flex items-center justify-center w-7 h-7 rounded-md text-slate-400 hover:bg-emerald-500/10 hover:text-emerald-500 transition-colors bg-transparent border-none cursor-pointer" onclick={(e) => { e.stopPropagation(); handlePushBranch(branch.name, nested.path); }} title="Push branch to remote"><Icon name="lucide:upload" class="w-3.5 h-3.5" /></button>
+					{/if}
+				{/if}
+				<button type="button" class="pointer-events-auto flex items-center justify-center w-7 h-7 rounded-md text-slate-400 hover:bg-red-500/10 hover:text-red-500 transition-colors bg-transparent border-none cursor-pointer" onclick={(e) => { e.stopPropagation(); handleDeleteNestedBranch(nested, branch.name); }} title="Delete branch"><Icon name="lucide:trash-2" class="w-3.5 h-3.5" /></button>
+			</div>
+			{/if}
+		</div>
+		{#if isExpanded}
+			<div class="ml-5 mt-0.5 mb-1 border-l border-slate-200 dark:border-slate-700 pl-2 space-y-0.5">
+				{#if commitState?.isLoading && commitState.commits.length === 0}
+					<div class="flex items-center gap-2 py-2 text-xs text-slate-400"><div class="w-3 h-3 border border-slate-400 border-t-transparent rounded-full animate-spin"></div><span>Loading commits...</span></div>
+				{:else if !commitState || commitState.commits.length === 0}
+					<div class="py-2 text-xs text-slate-400">No commits</div>
+				{:else}
+					{#each commitState.commits as commit, i (commit.hash)}
+						{@const commitExpanded = expandedBranchCommits.has(commit.hash)}
+						{@const filesState = branchCommitFileState[commit.hash]}
+						{@const commitRelativeDate = formatRelativeTime(commit.date)}
+						{@const showHeadPush = branch.isCurrent && i === 0 && (!nestedPushed.has(branch.name) || (nested.info.ahead ?? 0) > 0)}
+						{@const headActionCount = !branch.isCurrent ? 2 : (i === 0 ? (showHeadPush || pushingBranch === branch.name ? 3 : 2) : 1)}
+						<div>
+							<div
+								class="group/commit relative flex items-center gap-1.5 w-full px-2 py-1.5 rounded-md hover:bg-slate-100 dark:hover:bg-slate-800/60 transition-colors cursor-pointer"
+								role="button"
+								tabindex="0"
+								onclick={() => toggleBranchCommitExpanded(commit.hash, nested.path)}
+								onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleBranchCommitExpanded(commit.hash, nested.path); } }}
+							>
+								<Icon name={commitExpanded ? 'lucide:chevron-down' : 'lucide:chevron-right'} class="w-3 h-3 shrink-0 text-slate-400" />
+								<div class="flex-1 min-w-0 flex flex-col justify-center overflow-hidden pr-2 {headActionCount === 1 ? 'group-hover/commit:pr-9' : headActionCount === 2 ? 'group-hover/commit:pr-16' : 'group-hover/commit:pr-24'} transition-[padding] duration-150">
+									<div class="flex min-w-0 items-center gap-2">
+										<span class="flex-1 min-w-0 text-sm text-slate-700 dark:text-slate-300 leading-tight truncate" title={commit.message}>{commit.message}</span>
+										{#if commitRelativeDate}<span class="text-3xs text-slate-400 shrink-0">{commitRelativeDate}</span>{/if}
+									</div>
+									<div class="flex min-w-0 items-center gap-1.5 mt-0.5">
+										<button type="button" class="font-mono text-xs text-violet-600 dark:text-violet-400 hover:text-violet-800 dark:hover:text-violet-300 bg-transparent border-none cursor-pointer p-0 shrink-0 transition-colors" onclick={(e) => copyCommitHash(commit.hash, e)} title="Copy commit hash">{commit.hashShort}</button>
+										{#if commit.author}<span class="flex-1 min-w-0 text-xs text-slate-500 truncate">{commit.author}</span>{/if}
+									</div>
+								</div>
+								<div class="absolute right-1.5 top-1/2 -translate-y-1/2 flex items-center gap-0.5 shrink-0 opacity-0 group-hover/commit:opacity-100">
+									<button type="button" class="flex items-center justify-center w-7 h-7 rounded-md text-slate-400 hover:text-violet-500 hover:bg-violet-500/10 transition-colors bg-transparent border-none cursor-pointer" onclick={(e) => { e.stopPropagation(); handleViewCommitDiffs(commit, nested.path); }} title="View all file diffs in this commit"><Icon name="lucide:file-diff" class="w-4 h-4" /></button>
+									{#if !branch.isCurrent}
+										<button type="button" class="flex items-center justify-center w-7 h-7 rounded-md text-slate-400 hover:text-emerald-500 hover:bg-emerald-500/10 transition-colors bg-transparent border-none cursor-pointer" onclick={(e) => { e.stopPropagation(); handleCherryPick(commit.hash, nested.path); }} title="Cherry-pick this commit onto {nested.info.current}"><Icon name="lucide:git-fork" class="w-4 h-4" /></button>
+									{:else if i === 0}
+										{#if pushingBranch === branch.name}
+											<div class="flex items-center justify-center w-7 h-7 text-slate-400"><Icon name="lucide:loader-circle" class="w-4 h-4 animate-spin" /></div>
+										{:else if showHeadPush}
+											{@const isDiverged = nestedPushed.has(branch.name) && (nested.info.ahead ?? 0) > 0 && (nested.info.behind ?? 0) > 0}
+											<button type="button" class="flex items-center justify-center w-7 h-7 rounded-md text-slate-400 hover:bg-emerald-500/10 hover:text-emerald-500 transition-colors bg-transparent border-none cursor-pointer" onclick={(e) => { e.stopPropagation(); handlePushFromBranchList(branch, nested.path); }} title={isDiverged ? `Force push ${branch.name} (diverged: ${nested.info.ahead} ahead, ${nested.info.behind} behind)` : `Push ${branch.name} to remote`}><Icon name="lucide:upload" class="w-4 h-4 {isDiverged ? 'text-amber-500' : ''}" /></button>
+										{/if}
+										<button type="button" class="flex items-center justify-center w-7 h-7 rounded-md text-slate-400 hover:text-amber-500 hover:bg-amber-500/10 transition-colors bg-transparent border-none cursor-pointer" onclick={(e) => { e.stopPropagation(); handleUndoHeadCommit(commit, branch, nested.path); }} title="Undo this commit (keep changes staged){nestedPushed.has(branch.name) && branch.ahead === 0 ? ' · force push needed after' : ''}"><Icon name="lucide:undo-2" class="w-4 h-4" /></button>
+									{/if}
+								</div>
+							</div>
+							{#if commitExpanded}
+								<div class="ml-5 mb-1 border-l border-slate-200 dark:border-slate-700 pl-2 space-y-0.5">
+									{#if filesState?.isLoading && filesState.files.length === 0}
+										<div class="flex items-center gap-2 py-1.5 text-xs text-slate-400"><div class="w-3 h-3 border border-slate-400 border-t-transparent rounded-full animate-spin"></div><span>Loading files...</span></div>
+									{:else if !filesState || filesState.files.length === 0}
+										<div class="py-1.5 text-xs text-slate-400">No files</div>
+									{:else}
+										{#each filesState.files as file (`${commit.hash}:${file.oldPath}:${file.newPath}`)}
+											{@const filePath = file.newPath || file.oldPath}
+											{@const fileParts = splitPath(filePath)}
+											<button type="button" class="group/file flex items-center gap-2 w-full px-2 py-1.5 rounded-md text-left hover:bg-slate-100 dark:hover:bg-slate-800/60 transition-colors bg-transparent border-none cursor-pointer" onclick={() => viewCommitFileDiff(file, 0, commit.hash)} title={filePath}><Icon name={getFileIcon(fileParts.fileName) as IconName} class="w-4 h-4 shrink-0" /><div class="flex items-baseline gap-1.5 min-w-0 flex-1"><span class="text-sm text-slate-600 dark:text-slate-300 truncate">{fileParts.fileName}</span>{#if fileParts.dirPath}<span class="text-2xs text-slate-400 dark:text-slate-500 truncate min-w-0" dir="rtl">{fileParts.dirPath}</span>{/if}</div><span class="w-4 text-center text-sm font-bold {getGitStatusColor(file.status)} shrink-0">{getGitStatusLabel(file.status)}</span></button>
+											{/each}
+										{/if}
+									</div>
+								{/if}
+							</div>
+						{/each}
+						{#if commitState.hasMore}<button type="button" class="flex items-center justify-center gap-2 w-full px-2 py-1.5 text-xs rounded-md text-slate-500 hover:text-violet-500 hover:bg-slate-100 dark:hover:bg-slate-800/60 transition-colors bg-transparent border-none cursor-pointer disabled:opacity-50" onclick={() => loadBranchCommits(branch.name, false, nested.path)} disabled={commitState.isLoading}>{#if commitState.isLoading}<div class="w-3 h-3 border border-slate-400 border-t-transparent rounded-full animate-spin"></div>{/if}<span>Load more</span></button>{/if}
+				{/if}
+			</div>
+		{/if}
+	</div>
+{/snippet}
+
+<!-- Nested changes block snippet (for Changes view) -->
+{#snippet nestedChangesBlock(nested: GitNestedRepoInfo)}
+	{@const prefix = nested.relPath + '/'}
+	{@const nestedStaged = nestedRepoFiles(nested.relPath, gitStatus.staged)}
+	{@const nestedAllChanges = nestedRepoFiles(nested.relPath, allChanges)}
+	{@const nestedConflicted = nestedRepoFiles(nested.relPath, gitStatus.conflicted)}
+	{@const nestedTotalChanges = nestedStaged.length + nestedAllChanges.length + nestedConflicted.length}
+	{@const isCollapsed = nestedReposCollapsed[nested.relPath] !== undefined
+		? nestedReposCollapsed[nested.relPath]
+		: true}
+	{@const defaultHeight = (branchInfo?.nested && branchInfo.nested.length === 1) ? 'auto' : '260px'}
+	{@const currentHeight = isCollapsed ? 'auto' : (nestedReposHeights[nested.relPath] ? `${nestedReposHeights[nested.relPath]}px` : defaultHeight)}
+	<div
+		class="relative flex flex-col min-h-0 bg-slate-50 dark:bg-slate-900 select-none border-t border-slate-200/60 dark:border-slate-800/60"
+		class:flex-none={isCollapsed || currentHeight !== 'auto'}
+		class:flex-auto={!isCollapsed && currentHeight === 'auto'}
+		style="height: {currentHeight}"
+	>
+		<!-- Header -->
+		<div
+			class="flex items-center gap-2 px-2 py-1.5 flex-shrink-0 cursor-pointer hover:bg-slate-100/50 dark:hover:bg-slate-800/30 transition-colors"
+			role="button"
+			tabindex="0"
+			onclick={() => toggleNestedRepoCollapsed(nested.relPath)}
+			onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleNestedRepoCollapsed(nested.relPath); } }}
+		>
+			<Icon name={isCollapsed ? "lucide:chevron-right" : "lucide:chevron-down"} class="w-4 h-4 text-slate-400 shrink-0" />
+			<Icon name="lucide:folder-git-2" class="w-4 h-4 text-slate-400 shrink-0" />
+			<div class="flex-1 min-w-0 flex flex-col justify-center overflow-hidden select-none">
+				<div class="flex items-center gap-2">
+					<span class="text-sm font-medium text-slate-900 dark:text-slate-100 whitespace-nowrap" title={nested.relPath}>{nested.relPath}</span>
+					{#if nested.isSubmodule}<span class="shrink-0 text-3xs font-medium px-1.5 py-0.5 rounded bg-blue-500/15 text-blue-600 dark:text-blue-400">submodule</span>{/if}
+					{#if nestedTotalChanges > 0}<span class="shrink-0 min-w-4 h-4 px-1 rounded-full bg-violet-500/15 text-violet-600 dark:text-violet-400 text-3xs font-semibold flex items-center justify-center">{nestedTotalChanges}</span>{/if}
+				</div>
+				{#if nested.error}<span class="text-xs text-red-500 truncate" title={nested.error}>{nested.error}</span>{/if}
+			</div>
+		</div>
+
+		{#if !isCollapsed}
+			<!-- Drag handle -->
+			<div
+				class="group absolute top-0 left-0 right-0 h-1.5 -translate-y-1/2 cursor-ns-resize border-none bg-transparent p-0 z-10"
+				role="separator"
+				aria-orientation="horizontal"
+				onmousedown={(e) => startNestedChangesResize(e, nested.relPath)}
+				title="Drag to resize nested repo"
+			>
+				<span
+					class="absolute left-0 right-0 top-1/2 h-px -translate-y-1/2 bg-slate-200 dark:bg-slate-700 transition-colors duration-150 group-hover:bg-violet-400"
+					style:background-color={isNestedRepoResizing[nested.relPath] ? '#A683FF' : undefined}
+				></span>
+			</div>
+			<!-- Nested repo changes content -->
+			{#if !nested.error}
+				<!-- Nested commit form -->
+				<CommitForm
+					stagedCount={nestedStaged.length}
+					isCommitting={getGitOps(projectId, nested.path).isCommitting}
+					onCommit={(msg) => handleCommit(msg, nested.path)}
+					hasRemotes={nestedRemoteNames(nested).length > 0}
+					selectedRemote={getNestedSelectedRemote(nested)}
+					currentBranch={nested.info.current}
+					branchAhead={nested.info.ahead ?? 0}
+					branchBehind={nested.info.behind ?? 0}
+					isPushing={getGitOps(projectId, nested.path).isPushing}
+					isPulling={getGitOps(projectId, nested.path).isPulling}
+					isMoreBusy={getGitOps(projectId, nested.path).isMoreBusy}
+					repoBusy={Boolean(nested.info.detached || nested.info.operation)}
+					repoBusyReason={nested.info.operation ? `A ${nested.info.operation} is in progress` : nested.info.detached ? 'HEAD is detached' : ''}
+					repoPath={nested.path}
+					onCreateBranch={(name) => createBranch(name, nested.path)}
+					onPush={() => handlePush(nested.path, getNestedSelectedRemote(nested))}
+					onPull={() => handlePull(nested.path, getNestedSelectedRemote(nested))}
+					onMoreAction={(action) => handleNestedMoreAction(action, nested.path)}
+				/>
+			{/if}
+
+			<div class="flex-1 overflow-y-auto min-h-0">
+				{#if nested.error}
+					<div class="flex flex-col items-center justify-center gap-2 py-6 text-red-500 text-xs">
+						<Icon name="lucide:triangle-alert" class="w-5 h-5 opacity-60" />
+						<span>{nested.error}</span>
+					</div>
+				{:else}
+					{#if nestedConflicted.length > 0}
+						<ChangesSection
+							title="Conflicts"
+							icon="lucide:triangle-alert"
+							files={nestedConflicted}
+							section="conflicted"
+							activeFilePath={activeTab?.filePath}
+							activeSection={activeTab?.section ?? null}
+							onViewDiff={(file, sec) => viewDiff(file, sec)}
+							onResolve={(path) => openConflictResolver(path)}
+						/>
+					{/if}
+					<ChangesSection
+						title="Staged Changes"
+						icon="lucide:circle-check"
+						files={nestedStaged}
+						section="staged"
+						activeFilePath={activeTab?.filePath}
+						activeSection={activeTab?.section ?? null}
+						onUnstage={(path) => unstageFile(path)}
+						onUnstageAll={async () => { if (projectId) { try { await ws.http('git:unstage-all', { projectId, repoPath: nested.path }); await loadStatus(); } catch (err) { debug.error('git', 'Failed to unstage all in nested repo:', err); } } }}
+						onStash={() => openStashPrompt('staged', nested.path)}
+						onViewDiff={(file, sec) => viewDiff(file, sec)}
+					/>
+					<ChangesSection
+						title="Changes"
+						icon="lucide:file-pen"
+						files={nestedAllChanges}
+						section="unstaged"
+						activeFilePath={activeTab?.filePath}
+						activeSection={activeTab?.section ?? null}
+						onStage={(path) => stageFile(path)}
+						onStageAll={async () => { if (projectId) { try { await ws.http('git:stage-all', { projectId, repoPath: nested.path }); await loadStatus(); } catch (err) { debug.error('git', 'Failed to stage all in nested repo:', err); } } }}
+						onDiscard={(path) => discardFile(path)}
+						onDiscardAll={async () => { if (projectId) { try { await ws.http('git:discard-all', { projectId, repoPath: nested.path }); await loadStatus(); } catch (err) { debug.error('git', 'Failed to discard all in nested repo:', err); } } }}
+						onViewDiff={(file, sec) => viewDiff(file, sec)}
+					/>
+					{#if nestedTotalChanges === 0 && !isLoading}
+						<div class="flex flex-col items-center justify-center gap-2 py-6 text-slate-500 text-xs">
+							<Icon name="lucide:circle-check" class="w-5 h-5 opacity-30" />
+							<span>Working tree clean</span>
+						</div>
+					{/if}
+				{/if}
+			</div>
+	{/if}
+</div>
+{/snippet}
+
+<!-- Nested repo block snippet -->
+{#snippet nestedRepoBlock(nested: GitNestedRepoInfo)}
+	{@const nestedSubTab = nestedBranchesSubTab(nested.relPath)}
+	{@const nestedQ = nestedSearchQuery(nested.relPath)}
+	{@const nestedRemoteQ = nestedRemoteSearchQuery(nested.relPath)}
+	{@const localBranches = filteredNestedLocalBranches(nested)}
+	{@const remoteBranches = filteredNestedRemoteBranches(nested)}
+	{@const isCollapsed = nestedReposCollapsed[nested.relPath] !== undefined
+		? nestedReposCollapsed[nested.relPath]
+		: true}
+	{@const defaultHeight = (branchInfo?.nested && branchInfo.nested.length === 1) ? 'auto' : '260px'}
+	{@const currentHeight = isCollapsed ? 'auto' : (nestedReposHeights[nested.relPath] ? `${nestedReposHeights[nested.relPath]}px` : defaultHeight)}
+	<div
+		class="relative flex flex-col min-h-0 bg-slate-50 dark:bg-slate-900 select-none {isCollapsed ? 'border-b border-slate-200/50 dark:border-slate-800/50' : ''}"
+		class:flex-none={isCollapsed || currentHeight !== 'auto'}
+		class:flex-auto={!isCollapsed && currentHeight === 'auto'}
+		style="height: {currentHeight}"
+	>
+		{#if !isCollapsed}
+			<!-- Drag handle -->
+			<div
+				class="group absolute top-0 left-0 right-0 h-1.5 -translate-y-1/2 cursor-ns-resize border-none bg-transparent p-0 z-10"
+				role="separator"
+				aria-orientation="horizontal"
+				onmousedown={(e) => startNestedRepoResize(e, nested.relPath)}
+				title="Drag to resize nested repo"
+			>
+				<span
+					class="absolute left-0 right-0 top-1/2 h-px -translate-y-1/2 bg-slate-200 dark:bg-slate-700 transition-colors duration-150 group-hover:bg-violet-400"
+					style:background-color={isNestedRepoResizing[nested.relPath] ? '#A683FF' : undefined}
+				></span>
+			</div>
+		{/if}
+
+		<div
+			class="flex items-center gap-2 px-2 py-1.5 flex-shrink-0 cursor-pointer hover:bg-slate-100/50 dark:hover:bg-slate-800/30 transition-colors"
+			role="button"
+			tabindex="0"
+			onclick={() => toggleNestedRepoCollapsed(nested.relPath)}
+			onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleNestedRepoCollapsed(nested.relPath); } }}
+		>
+			<Icon name={isCollapsed ? "lucide:chevron-right" : "lucide:chevron-down"} class="w-4 h-4 text-slate-400 shrink-0" />
+			<Icon name="lucide:folder-git-2" class="w-4 h-4 text-slate-400 shrink-0" />
+			<div class="flex-1 min-w-0 flex flex-col justify-center overflow-hidden select-none">
+				<div class="flex items-center gap-2">
+					<span class="text-sm font-medium text-slate-900 dark:text-slate-100 whitespace-nowrap" title={nested.path}>{nested.relPath}</span>
+					{#if nested.isSubmodule}<span class="shrink-0 text-3xs font-medium px-1.5 py-0.5 rounded bg-blue-500/15 text-blue-600 dark:text-blue-400">submodule</span>{/if}
+				</div>
+				{#if nested.error}<span class="text-xs text-red-500 truncate" title={nested.error}>{nested.error}</span>{/if}
+			</div>
+		</div>
+
+		{#if !isCollapsed}
+			<!-- Static Controls Header (Tabs, Search, Create Button) -->
+			<div class="px-2 pb-2 mt-1.5 flex-shrink-0">
+				<div class="flex gap-1 pb-2">
+					<button type="button" class="px-2.5 py-1 text-xs font-medium rounded-md transition-colors cursor-pointer border-none {nestedSubTab === 'local' ? 'bg-violet-500/10 text-violet-600' : 'bg-transparent text-slate-500 hover:text-slate-700 dark:hover:text-slate-300'}" onclick={() => { setNestedBranchesSubTab(nested.relPath, 'local'); }}>Local ({localBranches.length})</button>
+					<button type="button" class="px-2.5 py-1 text-xs font-medium rounded-md transition-colors cursor-pointer border-none {nestedSubTab === 'remote' ? 'bg-violet-500/10 text-violet-600' : 'bg-transparent text-slate-500 hover:text-slate-700 dark:hover:text-slate-300'}" onclick={() => setNestedBranchesSubTab(nested.relPath, 'remote')}>Remote ({remoteBranches.length})</button>
+				</div>
+				{#if nestedSubTab === 'local'}
+					<div class="pb-2">
+						<div class="flex items-center gap-2 py-1.5 px-2.5 bg-slate-100/80 dark:bg-slate-800/80 border border-slate-200 dark:border-slate-800 rounded-lg">
+							<Icon name="lucide:search" class="w-3.5 h-3.5 text-slate-500 dark:text-slate-400 shrink-0" />
+							<input type="text" value={nestedQ} oninput={(e) => setNestedSearchQuery(nested.relPath, e.currentTarget.value)} placeholder="Search branches..." class="flex-1 bg-transparent border-none outline-none text-slate-900 dark:text-slate-100 text-xs placeholder:text-slate-500 dark:placeholder:text-slate-400" />
+							{#if nestedQ}
+								<button type="button" class="flex items-center justify-center w-5 h-5 bg-transparent border-none rounded text-slate-400 cursor-pointer hover:text-slate-600 dark:hover:text-slate-300" onclick={() => setNestedSearchQuery(nested.relPath, '')}><Icon name="lucide:x" class="w-3 h-3" /></button>
+							{/if}
+						</div>
+					</div>
+					<div>
+						{#if nestedShowCreateForm[nested.relPath]}
+							<div class="p-2.5 bg-slate-50 dark:bg-slate-800/50 border border-slate-200 dark:border-slate-700 rounded-lg space-y-2">
+								<input type="text" value={nestedNewBranchName(nested.relPath)} oninput={(e) => setNestedNewBranchName(nested.relPath, e.currentTarget.value)} placeholder="New branch name..." class="w-full px-2.5 py-2 text-sm bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded-md text-slate-900 dark:text-slate-100 outline-none focus:border-violet-500/40 focus:ring-1 focus:ring-violet-500/20" onkeydown={(e) => e.key === 'Enter' && handleCreateNestedBranch(nested)} autofocus />
+								<div class="flex gap-1.5">
+									<button type="button" class="flex-1 px-3 py-1.5 text-xs font-medium rounded-md transition-colors cursor-pointer border-none {nestedNewBranchName(nested.relPath).trim() ? 'bg-violet-600 text-white hover:bg-violet-700' : 'bg-slate-200 dark:bg-slate-700 text-slate-400 dark:text-slate-500 cursor-not-allowed'}" onclick={() => handleCreateNestedBranch(nested)} disabled={!nestedNewBranchName(nested.relPath).trim()}>Create Branch</button>
+									<button type="button" class="px-3 py-1.5 text-xs font-medium bg-transparent border border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-400 rounded-md hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors cursor-pointer" onclick={() => toggleNestedCreateForm(nested.relPath)}>Cancel</button>
+								</div>
+							</div>
+						{:else}
+							<button type="button" class="flex items-center justify-center gap-2 w-full py-2 px-3 border border-dashed border-slate-300 dark:border-slate-600 rounded-lg text-xs text-slate-500 hover:text-violet-600 hover:border-violet-400 transition-colors cursor-pointer bg-transparent" onclick={() => toggleNestedCreateForm(nested.relPath)}><Icon name="lucide:plus" class="w-3.5 h-3.5" /><span>Create New Branch</span></button>
+						{/if}
+					</div>
+				{:else}
+					<div>
+						<div class="flex items-center gap-2 py-1.5 px-2.5 bg-slate-100/80 dark:bg-slate-800/80 border border-slate-200 dark:border-slate-800 rounded-lg">
+							<Icon name="lucide:search" class="w-3.5 h-3.5 text-slate-500 dark:text-slate-400 shrink-0" />
+							<input type="text" value={nestedRemoteQ} oninput={(e) => setNestedRemoteSearchQuery(nested.relPath, e.currentTarget.value)} placeholder="Search branches..." class="flex-1 bg-transparent border-none outline-none text-slate-900 dark:text-slate-100 text-xs placeholder:text-slate-500 dark:placeholder:text-slate-400" />
+							{#if nestedRemoteQ}
+								<button type="button" class="flex items-center justify-center w-5 h-5 bg-transparent border-none rounded text-slate-400 cursor-pointer hover:text-slate-600 dark:hover:text-slate-300" onclick={() => setNestedRemoteSearchQuery(nested.relPath, '')}><Icon name="lucide:x" class="w-3 h-3" /></button>
+							{/if}
+						</div>
+					</div>
+				{/if}
+			</div>
+
+			<!-- Scrollable Branches Area -->
+			<div class="flex-1 overflow-y-auto px-2 pb-2 min-h-0">
+				{#if nestedSubTab === 'local'}
+					<div class="space-y-0.5">
+						{#if localBranches.length === 0}
+							<div class="flex flex-col items-center justify-center gap-2 py-6 text-slate-500 text-xs"><Icon name="lucide:git-branch" class="w-5 h-5 opacity-30" /><span>{nestedQ ? 'No branches match your search' : 'No branches'}</span></div>
+						{:else}
+							{#each localBranches as branch (branch.name)}
+								{@render nestedRepoBranchRow(nested, branch)}
+							{/each}
+						{/if}
+					</div>
+				{:else}
+					<div class="space-y-0.5">
+						{#if remoteBranches.length === 0}
+							<div class="flex flex-col items-center justify-center gap-2 py-6 text-slate-500 text-xs"><Icon name="lucide:server-off" class="w-5 h-5 opacity-30" /><span>{nestedRemoteQ ? 'No branches match your search' : 'No remote branches'}</span></div>
+						{:else}
+							{#each nestedRemoteNames(nested) as remoteName}
+								{@const rbList = remoteBranches.filter(b => b.name.startsWith(remoteName + '/'))}
+								<div>
+									<div class="flex items-center gap-1.5 pl-1.5 pr-2.5 py-1.5 rounded-md border border-transparent hover:bg-slate-100 dark:hover:bg-slate-800/60">
+										<Icon name="lucide:server" class="w-4 h-4 shrink-0 text-slate-400" />
+										<span class="text-sm font-medium text-slate-900 dark:text-slate-100 truncate">{remoteName}</span>
+									</div>
+									<div class="ml-5 mt-0.5 mb-1 border-l border-slate-200 dark:border-slate-700 pl-2 space-y-0.5">
+										{#each rbList as branch (branch.name)}
+											{@const branchRelativeDate = formatRelativeTime(branch.lastCommitDate)}
+											{@const shortName = branch.name.substring(remoteName.length + 1)}
+											{@const isDeleting = deletingRemoteBranch === nestedRemoteBranchKey(remoteName, shortName, nested.path)}
+											<div class="group/rb relative flex items-center gap-1.5 px-2 py-1.5 rounded-md hover:bg-slate-100 dark:hover:bg-slate-800/60 transition-colors">
+												<div class="flex-1 min-w-0 flex flex-col justify-center overflow-hidden pr-2 group-hover/rb:pr-20 transition-[padding] duration-150">
+													<span class="text-sm text-slate-700 dark:text-slate-300 whitespace-nowrap leading-tight truncate" title={branch.name}>{shortName}</span>
+													{#if branchRelativeDate}<span class="text-xs text-slate-500 leading-tight">{branchRelativeDate}</span>{/if}
+												</div>
+												{#if isDeleting}
+													<div class="flex items-center justify-center w-7 h-7 text-slate-400 shrink-0"><Icon name="lucide:loader-circle" class="w-3.5 h-3.5 animate-spin" /></div>
+												{:else}
+													<div class="pointer-events-none absolute inset-y-0 right-0 flex items-center gap-1 pl-1 pr-2 bg-white/20 opacity-0 backdrop-blur-md supports-[backdrop-filter]:bg-white/10 transition-opacity group-hover/rb:opacity-100 dark:bg-slate-900/20 dark:supports-[backdrop-filter]:bg-slate-900/10">
+														<button type="button" class="pointer-events-auto flex items-center justify-center w-7 h-7 rounded-md text-slate-400 hover:bg-violet-500/10 hover:text-violet-500 transition-colors bg-transparent border-none cursor-pointer" onclick={(e) => { e.stopPropagation(); checkoutRemoteBranch(branch.name, nested.path); }} title="Checkout locally"><Icon name="lucide:arrow-right" class="w-3.5 h-3.5" /></button>
+														<button type="button" class="pointer-events-auto flex items-center justify-center w-7 h-7 rounded-md text-slate-400 hover:bg-blue-500/10 hover:text-blue-500 transition-colors bg-transparent border-none cursor-pointer" onclick={(e) => { e.stopPropagation(); copyToClipboard(branch.name); }} title="Copy branch name"><Icon name="lucide:copy" class="w-3.5 h-3.5" /></button>
+														<button type="button" class="pointer-events-auto flex items-center justify-center w-7 h-7 rounded-md text-slate-400 hover:bg-red-500/10 hover:text-red-500 transition-colors bg-transparent border-none cursor-pointer" onclick={(e) => { e.stopPropagation(); handleDeleteRemoteBranch(remoteName, shortName, nested.path); }} title="Delete branch"><Icon name="lucide:trash-2" class="w-3.5 h-3.5" /></button>
+													</div>
+												{/if}
+											</div>
+										{/each}
+									</div>
+								</div>
+							{/each}
+						{/if}
+					</div>
+				{/if}
+			</div>
+		{/if}
+	</div>
+{/snippet}
+
+<!-- Nested repo log block snippet -->
+{#snippet nestedLogBlock(nested: GitNestedRepoInfo)}
+	{@const commitsList = nestedCommits[nested.relPath] || []}
+	{@const isCollapsed = nestedReposCollapsed[nested.relPath] !== undefined
+		? nestedReposCollapsed[nested.relPath]
+		: true}
+	{@const defaultHeight = (branchInfo?.nested && branchInfo.nested.length === 1) ? 'auto' : '260px'}
+	{@const currentHeight = isCollapsed ? 'auto' : (nestedReposHeights[nested.relPath] ? `${nestedReposHeights[nested.relPath]}px` : defaultHeight)}
+	<div
+		class="relative flex flex-col min-h-0 bg-slate-50 dark:bg-slate-900 select-none {isCollapsed ? 'border-b border-slate-200/50 dark:border-slate-800/50' : ''}"
+		class:flex-none={isCollapsed || currentHeight !== 'auto'}
+		class:flex-auto={!isCollapsed && currentHeight === 'auto'}
+		style="height: {currentHeight}"
+	>
+		{#if !isCollapsed}
+			<!-- Drag handle -->
+			<div
+				class="group absolute top-0 left-0 right-0 h-1.5 -translate-y-1/2 cursor-ns-resize border-none bg-transparent p-0 z-10"
+				role="separator"
+				aria-orientation="horizontal"
+				onmousedown={(e) => startNestedLogResize(e, nested.relPath)}
+				title="Drag to resize nested repo log"
+			>
+				<span
+					class="absolute left-0 right-0 top-1/2 h-px -translate-y-1/2 bg-slate-200 dark:bg-slate-700 transition-colors duration-150 group-hover:bg-violet-400"
+					style:background-color={isNestedRepoResizing[nested.relPath] ? '#A683FF' : undefined}
+				></span>
+			</div>
+		{/if}
+
+		<div
+			class="flex items-center gap-2 px-2 py-1.5 flex-shrink-0 cursor-pointer hover:bg-slate-100/50 dark:hover:bg-slate-800/30 transition-colors"
+			role="button"
+			tabindex="0"
+			onclick={() => toggleNestedRepoCollapsed(nested.relPath)}
+			onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleNestedRepoCollapsed(nested.relPath); } }}
+		>
+			<Icon name={isCollapsed ? "lucide:chevron-right" : "lucide:chevron-down"} class="w-4 h-4 text-slate-400 shrink-0" />
+			<Icon name="lucide:folder-git-2" class="w-4 h-4 text-slate-400 shrink-0" />
+			<div class="flex-1 min-w-0 flex flex-col justify-center overflow-hidden select-none">
+				<div class="flex items-center gap-2">
+					<span class="text-sm font-medium text-slate-900 dark:text-slate-100 whitespace-nowrap" title={nested.path}>{nested.relPath}</span>
+					{#if nested.isSubmodule}<span class="shrink-0 text-3xs font-medium px-1.5 py-0.5 rounded bg-blue-500/15 text-blue-600 dark:text-blue-400">submodule</span>{/if}
+				</div>
+				{#if nested.error}<span class="text-xs text-red-500 truncate" title={nested.error}>{nested.error}</span>{/if}
+			</div>
+		</div>
+
+		{#if !isCollapsed}
+			<div class="flex-1 min-h-0 flex flex-col">
+				<GitLog
+					commits={commitsList}
+					isLoading={nestedIsLogLoading[nested.relPath] || false}
+					hasMore={nestedLogHasMore[nested.relPath] || false}
+					activeHash={activeTab?.commitHash ?? null}
+					onLoadMore={() => loadNestedLog(nested.relPath, nested.path)}
+					onViewCommit={(hash) => viewCommitDiff(hash, nested.path)}
+					onCheckoutCommit={(hash) => checkoutCommit(hash, nested.path)}
+					getRemoteCommitUrl={(hash) => buildRemoteCommitUrl(hash, nested.path)}
+				/>
+			</div>
+		{/if}
+	</div>
+{/snippet}
+
+<!-- Nested repo stash block snippet -->
+{#snippet nestedStashBlock(nested: GitNestedRepoInfo)}
+	{@const nestedStashes = stashEntries.filter(e => e.repoPath === nested.path)}
+	{@const isCollapsed = nestedReposCollapsed[nested.relPath] !== undefined
+		? nestedReposCollapsed[nested.relPath]
+		: true}
+	{@const defaultHeight = (branchInfo?.nested && branchInfo.nested.length === 1) ? 'auto' : '260px'}
+	{@const currentHeight = isCollapsed ? 'auto' : (nestedReposHeights[nested.relPath] ? `${nestedReposHeights[nested.relPath]}px` : defaultHeight)}
+	<div
+		class="relative flex flex-col min-h-0 bg-slate-50 dark:bg-slate-900 select-none border-t border-slate-200/60 dark:border-slate-800/60 {isCollapsed ? 'border-b border-slate-200/50 dark:border-slate-800/50' : ''}"
+		class:flex-none={isCollapsed || currentHeight !== 'auto'}
+		class:flex-auto={!isCollapsed && currentHeight === 'auto'}
+		style="height: {currentHeight}"
+	>
+		{#if !isCollapsed}
+			<!-- Drag handle -->
+			<div
+				class="group absolute top-0 left-0 right-0 h-1.5 -translate-y-1/2 cursor-ns-resize border-none bg-transparent p-0 z-10"
+				role="separator"
+				aria-orientation="horizontal"
+				onmousedown={(e) => startNestedStashResize(e, nested.relPath)}
+				title="Drag to resize nested repo stash"
+			>
+				<span
+					class="absolute left-0 right-0 top-1/2 h-px -translate-y-1/2 bg-slate-200 dark:bg-slate-700 transition-colors duration-150 group-hover:bg-violet-400"
+					style:background-color={isNestedRepoResizing[nested.relPath] ? '#A683FF' : undefined}
+				></span>
+			</div>
+		{/if}
+
+		<div
+			class="flex items-center gap-2 px-2 py-1.5 flex-shrink-0 cursor-pointer hover:bg-slate-100/50 dark:hover:bg-slate-800/30 transition-colors"
+			role="button"
+			tabindex="0"
+			onclick={() => toggleNestedRepoCollapsed(nested.relPath)}
+			onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleNestedRepoCollapsed(nested.relPath); } }}
+		>
+			<Icon name={isCollapsed ? "lucide:chevron-right" : "lucide:chevron-down"} class="w-4 h-4 text-slate-400 shrink-0" />
+			<Icon name="lucide:folder-git-2" class="w-4 h-4 text-slate-400 shrink-0" />
+			<div class="flex-1 min-w-0 flex flex-col justify-center overflow-hidden select-none">
+				<div class="flex items-center gap-2">
+					<span class="text-sm font-medium text-slate-900 dark:text-slate-100 whitespace-nowrap" title={nested.path}>{nested.relPath}</span>
+					{#if nested.isSubmodule}<span class="shrink-0 text-3xs font-medium px-1.5 py-0.5 rounded bg-blue-500/15 text-blue-600 dark:text-blue-400">submodule</span>{/if}
+					{#if nestedStashes.length > 0}<span class="shrink-0 min-w-4 h-4 px-1 rounded-full bg-violet-500/15 text-violet-600 dark:text-violet-400 text-3xs font-semibold flex items-center justify-center">{nestedStashes.length}</span>{/if}
+				</div>
+				{#if nested.error}<span class="text-xs text-red-500 truncate" title={nested.error}>{nested.error}</span>{/if}
+			</div>
+		</div>
+
+		{#if !isCollapsed}
+			<div class="flex-1 min-h-0 flex flex-col px-2 overflow-y-auto">
+				{#if nested.error}
+					<div class="flex flex-col items-center justify-center gap-2 py-6 text-red-500 text-xs">
+						<Icon name="lucide:triangle-alert" class="w-5 h-5 opacity-60" />
+						<span>{nested.error}</span>
+					</div>
+				{:else}
+					<div class="pb-2 pt-1.5">
+						{#if showStashSaveForm && stashRepoPath === nested.path}
+							<div class="p-2.5 bg-slate-50 dark:bg-slate-800/50 border border-slate-200 dark:border-slate-700 rounded-lg space-y-2">
+								<input type="text" data-stash-message-input bind:value={stashMessage} placeholder="Stash message (optional)..." class="w-full px-2.5 py-2 text-sm bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded-md text-slate-900 dark:text-slate-100 outline-none focus:border-violet-500/40 focus:ring-1 focus:ring-violet-500/20" onkeydown={(e) => e.key === 'Enter' && handleStashSave()} />
+								<div class="flex gap-1 p-0.5 bg-slate-100 dark:bg-slate-800 rounded-md">
+									<button type="button" class="flex-1 px-2 py-1 text-xs font-medium rounded transition-colors cursor-pointer border-none {!stashStagedOnly ? 'bg-white dark:bg-slate-700 text-slate-900 dark:text-slate-100 shadow-sm' : 'bg-transparent text-slate-500 hover:text-slate-700 dark:hover:text-slate-300'}" onclick={() => stashStagedOnly = false}>All changes</button>
+									<button type="button" class="flex-1 px-2 py-1 text-xs font-medium rounded transition-colors cursor-pointer border-none {stashStagedOnly ? 'bg-white dark:bg-slate-700 text-slate-900 dark:text-slate-100 shadow-sm' : 'bg-transparent text-slate-500 hover:text-slate-700 dark:hover:text-slate-300'}" onclick={() => stashStagedOnly = true}>Staged only</button>
+								</div>
+								<div class="flex gap-1.5">
+									<button type="button" class="flex-1 px-3 py-1.5 text-xs font-medium rounded-md bg-violet-600 text-white hover:bg-violet-700 transition-colors cursor-pointer border-none" onclick={handleStashSave}>Stash Changes</button>
+									<button type="button" class="px-3 py-1.5 text-xs font-medium bg-transparent border border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-400 rounded-md hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors cursor-pointer" onclick={() => { showStashSaveForm = false; stashMessage = ''; stashStagedOnly = false; stashRepoPath = undefined; }}>Cancel</button>
+								</div>
+							</div>
+						{:else}
+							<button type="button" class="flex items-center justify-center gap-2 w-full py-2 px-3 border border-dashed border-slate-300 dark:border-slate-600 rounded-lg text-xs text-slate-500 hover:text-violet-600 hover:border-violet-400 transition-colors cursor-pointer bg-transparent" onclick={() => { stashStagedOnly = false; stashRepoPath = nested.path; showStashSaveForm = true; }}><Icon name="lucide:plus" class="w-3.5 h-3.5" /><span>Stash Current Changes</span></button>
+						{/if}
+					</div>
+					{#if nestedStashes.length === 0}
+						<div class="flex flex-col items-center justify-center gap-2 py-6 text-slate-500 text-xs">
+							<Icon name="lucide:archive" class="w-5 h-5 opacity-30" />
+							<span>No stashed changes</span>
+						</div>
+					{:else}
+						<div class="space-y-0.5 pb-2">
+							{#each nestedStashes as entry (getStashKey(entry))}
+								{@const relativeDate = formatRelativeTime(entry.date)}
+								{@const key = getStashKey(entry)}
+								{@const stashExpanded = expandedStashes.has(key)}
+								{@const sFiles = stashFileState[key]}
+								<div>
+									<div
+										class="group relative flex items-center gap-1.5 pl-1.5 pr-2.5 py-1.5 rounded-md hover:bg-slate-100 dark:hover:bg-slate-800/60 transition-colors cursor-pointer"
+										role="button"
+										tabindex="0"
+										onclick={() => toggleStashExpanded(entry)}
+										onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleStashExpanded(entry); } }}
+									>
+										<Icon name={stashExpanded ? 'lucide:chevron-down' : 'lucide:chevron-right'} class="w-3.5 h-3.5 shrink-0 text-slate-400" />
+										<div class="flex-1 min-w-0 pr-2 group-hover:pr-16 flex flex-col justify-center overflow-hidden transition-[padding] duration-150">
+											<p class="text-sm font-medium text-slate-900 dark:text-slate-100 truncate">{entry.message}</p>
+											<p class="text-xs text-slate-400 dark:text-slate-500">
+												<span>stash@&#123;{entry.index}&#125;</span>
+												{#if relativeDate}
+													<span class="mx-1">·</span><span>{relativeDate}</span>
+												{/if}
+											</p>
+										</div>
+										<div class="pointer-events-none absolute inset-y-0 right-0 flex items-center gap-1 pl-1 pr-2 bg-white/20 opacity-0 backdrop-blur-md supports-[backdrop-filter]:bg-white/10 transition-opacity group-hover:opacity-100 dark:bg-slate-900/20 dark:supports-[backdrop-filter]:bg-slate-900/10">
+											<button type="button" class="pointer-events-auto flex items-center justify-center w-7 h-7 rounded-md text-slate-400 hover:bg-emerald-500/10 hover:text-emerald-500 transition-colors bg-transparent border-none cursor-pointer" onclick={(e) => { e.stopPropagation(); handleStashPop(entry); }} title="Pop"><Icon name="lucide:archive-restore" class="w-3.5 h-3.5" /></button>
+											<button type="button" class="pointer-events-auto flex items-center justify-center w-7 h-7 rounded-md text-slate-400 hover:bg-red-500/10 hover:text-red-500 transition-colors bg-transparent border-none cursor-pointer" onclick={(e) => { e.stopPropagation(); handleStashDrop(entry); }} title="Drop"><Icon name="lucide:trash-2" class="w-3.5 h-3.5" /></button>
+										</div>
+									</div>
+									{#if stashExpanded}
+										<div class="ml-5 mt-0.5 mb-1 border-l border-slate-200 dark:border-slate-700 pl-2 space-y-0.5">
+											{#if sFiles?.isLoading && sFiles.files.length === 0}
+												<div class="flex items-center gap-2 py-1.5 text-xs text-slate-400"><div class="w-3 h-3 border border-slate-400 border-t-transparent rounded-full animate-spin"></div><span>Loading files...</span></div>
+											{:else if !sFiles || sFiles.files.length === 0}
+												<div class="py-1.5 text-xs text-slate-400">No files</div>
+											{:else}
+												{#each sFiles.files as file (`${key}:${file.oldPath}:${file.newPath}`)}
+													{@const filePath = file.newPath || file.oldPath}
+													{@const fileParts = splitPath(filePath)}
+													<button type="button" class="flex items-center gap-2 w-full px-2 py-1.5 rounded-md text-left hover:bg-slate-100 dark:hover:bg-slate-800/60 transition-colors bg-transparent border-none cursor-pointer" onclick={() => viewStashFileDiff(file, entry)} title={filePath}><Icon name={getFileIcon(fileParts.fileName) as IconName} class="w-4 h-4 shrink-0" /><div class="flex items-baseline gap-1.5 min-w-0 flex-1"><span class="text-sm text-slate-600 dark:text-slate-300 truncate">{fileParts.fileName}</span>{#if fileParts.dirPath}<span class="text-2xs text-slate-400 dark:text-slate-500 truncate min-w-0" dir="rtl">{fileParts.dirPath}</span>{/if}</div><span class="w-4 text-center text-sm font-bold {getGitStatusColor(file.status)} shrink-0">{getGitStatusLabel(file.status)}</span></button>
+												{/each}
+											{/if}
+										</div>
+									{/if}
+								</div>
+							{/each}
+						</div>
+					{/if}
+				{/if}
+			</div>
+		{/if}
+	</div>
+{/snippet}
+
+<!-- Nested repo tags block snippet -->
+{#snippet nestedTagBlock(nested: GitNestedRepoInfo)}
+	{@const nestedTags = tags.filter(t => t.repoPath === nested.path)}
+	{@const isCollapsed = nestedReposCollapsed[nested.relPath] !== undefined
+		? nestedReposCollapsed[nested.relPath]
+		: true}
+	{@const defaultHeight = (branchInfo?.nested && branchInfo.nested.length === 1) ? 'auto' : '260px'}
+	{@const currentHeight = isCollapsed ? 'auto' : (nestedReposHeights[nested.relPath] ? `${nestedReposHeights[nested.relPath]}px` : defaultHeight)}
+	<div
+		class="relative flex flex-col min-h-0 bg-slate-50 dark:bg-slate-900 select-none border-t border-slate-200/60 dark:border-slate-800/60 {isCollapsed ? 'border-b border-slate-200/50 dark:border-slate-800/50' : ''}"
+		class:flex-none={isCollapsed || currentHeight !== 'auto'}
+		class:flex-auto={!isCollapsed && currentHeight === 'auto'}
+		style="height: {currentHeight}"
+	>
+		{#if !isCollapsed}
+			<!-- Drag handle -->
+			<div
+				class="group absolute top-0 left-0 right-0 h-1.5 -translate-y-1/2 cursor-ns-resize border-none bg-transparent p-0 z-10"
+				role="separator"
+				aria-orientation="horizontal"
+				onmousedown={(e) => startNestedTagsResize(e, nested.relPath)}
+				title="Drag to resize nested repo tags"
+			>
+				<span
+					class="absolute left-0 right-0 top-1/2 h-px -translate-y-1/2 bg-slate-200 dark:bg-slate-700 transition-colors duration-150 group-hover:bg-violet-400"
+					style:background-color={isNestedRepoResizing[nested.relPath] ? '#A683FF' : undefined}
+				></span>
+			</div>
+		{/if}
+
+		<div
+			class="flex items-center gap-2 px-2 py-1.5 flex-shrink-0 cursor-pointer hover:bg-slate-100/50 dark:hover:bg-slate-800/30 transition-colors"
+			role="button"
+			tabindex="0"
+			onclick={() => toggleNestedRepoCollapsed(nested.relPath)}
+			onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleNestedRepoCollapsed(nested.relPath); } }}
+		>
+			<Icon name={isCollapsed ? "lucide:chevron-right" : "lucide:chevron-down"} class="w-4 h-4 text-slate-400 shrink-0" />
+			<Icon name="lucide:folder-git-2" class="w-4 h-4 text-slate-400 shrink-0" />
+			<div class="flex-1 min-w-0 flex flex-col justify-center overflow-hidden select-none">
+				<div class="flex items-center gap-2">
+					<span class="text-sm font-medium text-slate-900 dark:text-slate-100 whitespace-nowrap" title={nested.path}>{nested.relPath}</span>
+					{#if nested.isSubmodule}<span class="shrink-0 text-3xs font-medium px-1.5 py-0.5 rounded bg-blue-500/15 text-blue-600 dark:text-blue-400">submodule</span>{/if}
+					{#if nestedTags.length > 0}<span class="shrink-0 min-w-4 h-4 px-1 rounded-full bg-violet-500/15 text-violet-600 dark:text-violet-400 text-3xs font-semibold flex items-center justify-center">{nestedTags.length}</span>{/if}
+				</div>
+				{#if nested.error}<span class="text-xs text-red-500 truncate" title={nested.error}>{nested.error}</span>{/if}
+			</div>
+		</div>
+
+		{#if !isCollapsed}
+			<div class="flex-1 min-h-0 flex flex-col px-2 overflow-y-auto">
+				{#if nested.error}
+					<div class="flex flex-col items-center justify-center gap-2 py-6 text-red-500 text-xs">
+						<Icon name="lucide:triangle-alert" class="w-5 h-5 opacity-60" />
+						<span>{nested.error}</span>
+					</div>
+				{:else}
+					<div class="pb-2 pt-1.5">
+						{#if showCreateTagForm && tagRepoPath === nested.path}
+							<div class="p-2.5 bg-slate-50 dark:bg-slate-800/50 border border-slate-200 dark:border-slate-700 rounded-lg space-y-2">
+								<input
+									type="text"
+									bind:value={newTagName}
+									placeholder="Tag name (e.g. v1.0.0)..."
+									class="w-full px-2.5 py-2 text-sm bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded-md text-slate-900 dark:text-slate-100 outline-none focus:border-violet-500/40 focus:ring-1 focus:ring-violet-500/20"
+									onkeydown={(e) => e.key === 'Enter' && !newTagMessage && handleCreateTag()}
+								/>
+								<input
+									type="text"
+									bind:value={newTagMessage}
+									placeholder="Tag message (optional, makes annotated tag)..."
+									class="w-full px-2.5 py-2 text-sm bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded-md text-slate-900 dark:text-slate-100 outline-none focus:border-violet-500/40 focus:ring-1 focus:ring-violet-500/20"
+									onkeydown={(e) => e.key === 'Enter' && handleCreateTag()}
+								/>
+								<div class="flex gap-1.5">
+									<button
+										type="button"
+										class="flex-1 px-3 py-1.5 text-xs font-medium rounded-md transition-colors cursor-pointer border-none
+											{newTagName.trim()
+												? 'bg-violet-600 text-white hover:bg-violet-700'
+												: 'bg-slate-200 dark:bg-slate-700 text-slate-400 dark:text-slate-500 cursor-not-allowed'}"
+										onclick={handleCreateTag}
+										disabled={!newTagName.trim()}
+									>
+										Create Tag
+									</button>
+									<button
+										type="button"
+										class="px-3 py-1.5 text-xs font-medium bg-transparent border border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-400 rounded-md hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors cursor-pointer"
+										onclick={() => { showCreateTagForm = false; newTagName = ''; newTagMessage = ''; tagRepoPath = undefined; }}
+									>
+										Cancel
+									</button>
+								</div>
+							</div>
+						{:else}
+							<button
+								type="button"
+								class="flex items-center justify-center gap-2 w-full py-2 px-3 border border-dashed border-slate-300 dark:border-slate-600 rounded-lg text-xs text-slate-500 hover:text-violet-600 hover:border-violet-400 transition-colors cursor-pointer bg-transparent"
+								onclick={() => { tagRepoPath = nested.path; showCreateTagForm = true; }}
+							>
+								<Icon name="lucide:plus" class="w-3.5 h-3.5" />
+								<span>Create New Tag</span>
+							</button>
+						{/if}
+					</div>
+					{#if nestedTags.length === 0}
+						<div class="flex flex-col items-center justify-center gap-2 py-6 text-slate-500 text-xs">
+							<Icon name="lucide:tag" class="w-5 h-5 opacity-30" />
+							<span>No tags</span>
+						</div>
+					{:else}
+						<div class="space-y-1 pb-2">
+							{#each nestedTags as tag (tag.name)}
+								<div class="group flex items-center gap-2 px-2 py-1.5 rounded-md hover:bg-slate-100 dark:hover:bg-slate-800/60 transition-colors">
+									<div class="flex-1 min-w-0">
+										<p class="text-sm font-medium text-slate-900 dark:text-slate-100 truncate">{tag.name}</p>
+										<div class="flex items-center gap-1.5">
+											<button
+												type="button"
+												class="text-xs font-mono text-slate-400 dark:text-slate-500 hover:text-violet-600 dark:hover:text-violet-400 bg-transparent border-none cursor-pointer p-0 shrink-0 transition-colors"
+												onclick={(e) => copyTagHash(tag.hash, e)}
+												title="Copy tag hash"
+											>{tag.hash.slice(0, 7)}</button>
+											{#if tag.message}
+												<span class="text-xs text-slate-400 dark:text-slate-500 truncate">{tag.message}</span>
+											{/if}
+										</div>
+									</div>
+									<div class="flex items-center gap-0.5 shrink-0">
+										<button
+											type="button"
+											class="flex items-center justify-center w-7 h-7 rounded-md text-slate-400 hover:bg-blue-500/10 hover:text-blue-500 transition-colors bg-transparent border-none cursor-pointer"
+											onclick={() => handlePushTag(tag.name, nested.path)}
+											title="Push tag to remote"
+										>
+											<Icon name="lucide:arrow-up-from-line" class="w-3.5 h-3.5" />
+										</button>
+										<button
+											type="button"
+											class="flex items-center justify-center w-7 h-7 rounded-md text-slate-400 hover:bg-red-500/10 hover:text-red-500 transition-colors bg-transparent border-none cursor-pointer"
+											onclick={() => handleDeleteTag(tag.name, nested.path)}
+											title="Delete tag"
+										>
+											<Icon name="lucide:trash-2" class="w-3.5 h-3.5" />
+										</button>
+									</div>
+								</div>
+							{/each}
+						</div>
+					{/if}
+				{/if}
+			</div>
+		{/if}
+	</div>
+{/snippet}
+
+<!-- Nested repo contributors block snippet -->
+{#snippet nestedContributorBlock(nested: GitNestedRepoInfo)}
+	{@const nestedContribs = nestedContributors[nested.relPath] ?? []}
+	{@const nestedTotal = nestedContributorTotal[nested.relPath] ?? 0}
+	{@const nestedLog = nestedContributorLog[nested.relPath] ?? []}
+	{@const isLoadingNested = nestedIsContributorsLoading[nested.relPath] ?? false}
+	{@const isCollapsed = nestedReposCollapsed[nested.relPath] !== undefined
+		? nestedReposCollapsed[nested.relPath]
+		: true}
+	{@const defaultHeight = (branchInfo?.nested && branchInfo.nested.length === 1) ? 'auto' : '260px'}
+	{@const currentHeight = isCollapsed ? 'auto' : (nestedReposHeights[nested.relPath] ? `${nestedReposHeights[nested.relPath]}px` : defaultHeight)}
+	<div
+		class="relative flex flex-col min-h-0 bg-slate-50 dark:bg-slate-900 select-none border-t border-slate-200/60 dark:border-slate-800/60 {isCollapsed ? 'border-b border-slate-200/50 dark:border-slate-800/50' : ''}"
+		class:flex-none={isCollapsed || currentHeight !== 'auto'}
+		class:flex-auto={!isCollapsed && currentHeight === 'auto'}
+		style="height: {currentHeight}"
+	>
+		{#if !isCollapsed}
+			<!-- Drag handle -->
+			<div
+				class="group absolute top-0 left-0 right-0 h-1.5 -translate-y-1/2 cursor-ns-resize border-none bg-transparent p-0 z-10"
+				role="separator"
+				aria-orientation="horizontal"
+				onmousedown={(e) => startNestedContributorsResize(e, nested.relPath)}
+				title="Drag to resize nested repo contributors"
+			>
+				<span
+					class="absolute left-0 right-0 top-1/2 h-px -translate-y-1/2 bg-slate-200 dark:bg-slate-700 transition-colors duration-150 group-hover:bg-violet-400"
+					style:background-color={isNestedRepoResizing[nested.relPath] ? '#A683FF' : undefined}
+				></span>
+			</div>
+		{/if}
+
+		<div
+			class="flex items-center gap-2 px-2 py-1.5 flex-shrink-0 cursor-pointer hover:bg-slate-100/50 dark:hover:bg-slate-800/30 transition-colors"
+			role="button"
+			tabindex="0"
+			onclick={() => toggleNestedRepoCollapsed(nested.relPath)}
+			onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleNestedRepoCollapsed(nested.relPath); } }}
+		>
+			<Icon name={isCollapsed ? "lucide:chevron-right" : "lucide:chevron-down"} class="w-4 h-4 text-slate-400 shrink-0" />
+			<Icon name="lucide:folder-git-2" class="w-4 h-4 text-slate-400 shrink-0" />
+			<div class="flex-1 min-w-0 flex flex-col justify-center overflow-hidden select-none">
+				<div class="flex items-center gap-2">
+					<span class="text-sm font-medium text-slate-900 dark:text-slate-100 whitespace-nowrap" title={nested.path}>{nested.relPath}</span>
+					{#if nested.isSubmodule}<span class="shrink-0 text-3xs font-medium px-1.5 py-0.5 rounded bg-blue-500/15 text-blue-600 dark:text-blue-400">submodule</span>{/if}
+					{#if nestedContribs.length > 0}<span class="shrink-0 min-w-4 h-4 px-1 rounded-full bg-violet-500/15 text-violet-600 dark:text-violet-400 text-3xs font-semibold flex items-center justify-center">{nestedContribs.length}</span>{/if}
+				</div>
+				{#if nested.error}<span class="text-xs text-red-500 truncate" title={nested.error}>{nested.error}</span>{/if}
+			</div>
+		</div>
+
+		{#if !isCollapsed}
+			<div class="flex-1 min-h-0 flex flex-col px-2 overflow-y-auto">
+				{#if nested.error}
+					<div class="flex flex-col items-center justify-center gap-2 py-6 text-red-500 text-xs">
+						<Icon name="lucide:triangle-alert" class="w-5 h-5 opacity-60" />
+						<span>{nested.error}</span>
+					</div>
+				{:else if isLoadingNested}
+					<div class="flex items-center justify-center py-8"><div class="w-5 h-5 border-2 border-slate-200 dark:border-slate-700 border-t-violet-600 rounded-full animate-spin"></div></div>
+				{:else if nestedContribs.length === 0}
+					<div class="flex flex-col items-center justify-center gap-2 py-6 text-slate-500 text-xs">
+						<Icon name="lucide:users" class="w-5 h-5 opacity-30" />
+						<span>No contributors</span>
+					</div>
+				{:else}
+					<div class="space-y-0.5 pb-2 pt-1">
+						{#each nestedContribs as c, ci (`${nested.relPath}:${c.key}:${ci}`)}
+							{@const expanded = expandedContributors.has(`${nested.relPath}:${c.key}`)}
+							{@const share = nestedTotal > 0 ? Math.round((c.count / nestedTotal) * 100) : 0}
+							{@const lastActive = formatRelativeTime(c.lastDate)}
+							<div>
+								<div
+									class="flex items-center gap-2 px-2.5 py-2 rounded-md hover:bg-slate-100 dark:hover:bg-slate-800/60 transition-colors cursor-pointer"
+									role="button"
+									tabindex="0"
+									onclick={() => {
+										const scopedKey = `${nested.relPath}:${c.key}`;
+										const next = new Set(expandedContributors);
+										if (next.has(scopedKey)) { next.delete(scopedKey); } else { next.add(scopedKey); if (!contributorVisible[scopedKey]) { contributorVisible = { ...contributorVisible, [scopedKey]: CONTRIBUTOR_COMMIT_PAGE_SIZE }; } }
+										expandedContributors = next;
+									}}
+									onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); const scopedKey = `${nested.relPath}:${c.key}`; const next = new Set(expandedContributors); if (next.has(scopedKey)) { next.delete(scopedKey); } else { next.add(scopedKey); if (!contributorVisible[scopedKey]) { contributorVisible = { ...contributorVisible, [scopedKey]: CONTRIBUTOR_COMMIT_PAGE_SIZE }; } } expandedContributors = next; } }}
+								>
+									<Icon name={expanded ? 'lucide:chevron-down' : 'lucide:chevron-right'} class="w-3 h-3 shrink-0 text-slate-400" />
+									<div class="flex-1 min-w-0">
+										<div class="flex items-center gap-2 min-w-0">
+											<p class="flex-1 text-sm text-slate-700 dark:text-slate-300 truncate">{c.name}</p>
+											<span class="text-3xs text-slate-400 shrink-0 tabular-nums">{c.count} commit{c.count === 1 ? '' : 's'}{lastActive ? ` · ${lastActive}` : ''}</span>
+										</div>
+										<p class="text-xs text-slate-400 dark:text-slate-500 truncate">{c.email}</p>
+										<div class="flex items-center gap-2">
+											<div class="flex-1 h-1 rounded-full bg-slate-200/70 dark:bg-slate-700/60 overflow-hidden">
+												<div class="h-full rounded-full bg-violet-500/70" style="width: {share}%"></div>
+											</div>
+											<span class="text-3xs text-slate-400 shrink-0 tabular-nums">{share}%</span>
+										</div>
+									</div>
+								</div>
+								{#if expanded}
+									{@const scopedKey = `${nested.relPath}:${c.key}`}
+									{@const list = nestedLog.filter(commit => (commit.authorEmail || commit.author).toLowerCase().trim() === c.key)}
+									{@const visible = contributorVisible[scopedKey] ?? CONTRIBUTOR_COMMIT_PAGE_SIZE}
+									<div class="ml-5 mb-1 border-l border-slate-200 dark:border-slate-700 pl-2 space-y-0.5">
+										{#if list.length === 0}
+											<div class="py-1.5 text-xs text-slate-400">No commits in the sampled history</div>
+										{:else}
+											{#each list.slice(0, visible) as commit (commit.hash)}
+												{@const commitExpanded = expandedBranchCommits.has(commit.hash)}
+												{@const filesState = branchCommitFileState[commit.hash]}
+												{@const rel = formatRelativeTime(commit.date)}
+												<div>
+													<div
+														class="flex items-center gap-1.5 w-full px-2 py-1.5 rounded-md hover:bg-slate-100 dark:hover:bg-slate-800/60 transition-colors cursor-pointer"
+														role="button"
+														tabindex="0"
+														onclick={() => toggleBranchCommitExpanded(commit.hash, nested.path)}
+														onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleBranchCommitExpanded(commit.hash, nested.path); } }}
+													>
+														<Icon name={commitExpanded ? 'lucide:chevron-down' : 'lucide:chevron-right'} class="w-3 h-3 shrink-0 text-slate-400" />
+														<div class="flex-1 min-w-0 flex flex-col justify-center overflow-hidden">
+															<div class="flex min-w-0 items-center gap-2">
+																<span class="flex-1 min-w-0 text-sm text-slate-700 dark:text-slate-300 leading-tight truncate" title={commit.message}>{commit.message}</span>
+																{#if rel}<span class="text-3xs text-slate-400 shrink-0">{rel}</span>{/if}
+															</div>
+															<div class="flex min-w-0 items-center gap-1.5 mt-0.5">
+																<button type="button" class="font-mono text-xs text-violet-600 dark:text-violet-400 hover:text-violet-800 dark:hover:text-violet-300 bg-transparent border-none cursor-pointer p-0 shrink-0 transition-colors" onclick={(e) => copyCommitHash(commit.hash, e)} title="Copy commit hash">{commit.hashShort}</button>
+															</div>
+														</div>
+													</div>
+													{#if commitExpanded}
+														<div class="ml-5 mb-1 border-l border-slate-200 dark:border-slate-700 pl-2 space-y-0.5">
+															{#if filesState?.isLoading && filesState.files.length === 0}
+																<div class="flex items-center gap-2 py-1.5 text-xs text-slate-400"><div class="w-3 h-3 border border-slate-400 border-t-transparent rounded-full animate-spin"></div><span>Loading files...</span></div>
+															{:else if !filesState || filesState.files.length === 0}
+																<div class="py-1.5 text-xs text-slate-400">No files</div>
+															{:else}
+																{#each filesState.files as file (`${commit.hash}:${file.oldPath}:${file.newPath}`)}
+																	{@const filePath = file.newPath || file.oldPath}
+																	{@const fileParts = splitPath(filePath)}
+																	<button type="button" class="group/file flex items-center gap-2 w-full px-2 py-1.5 rounded-md text-left hover:bg-slate-100 dark:hover:bg-slate-800/60 transition-colors bg-transparent border-none cursor-pointer" onclick={() => viewCommitFileDiff(file, 0, commit.hash)} title={filePath}><Icon name={getFileIcon(fileParts.fileName) as IconName} class="w-4 h-4 shrink-0" /><div class="flex items-baseline gap-1.5 min-w-0 flex-1"><span class="text-sm text-slate-600 dark:text-slate-300 truncate">{fileParts.fileName}</span>{#if fileParts.dirPath}<span class="text-2xs text-slate-400 dark:text-slate-500 truncate min-w-0" dir="rtl">{fileParts.dirPath}</span>{/if}</div><span class="w-4 text-center text-sm font-bold {getGitStatusColor(file.status)} shrink-0">{getGitStatusLabel(file.status)}</span></button>
+																{/each}
+															{/if}
+														</div>
+													{/if}
+												</div>
+											{/each}
+											{#if visible < list.length}
+												<button type="button" class="flex items-center justify-center gap-2 w-full px-2 py-1.5 text-xs rounded-md text-slate-500 hover:text-violet-500 hover:bg-slate-100 dark:hover:bg-slate-800/60 transition-colors bg-transparent border-none cursor-pointer" onclick={() => { const sk = `${nested.relPath}:${c.key}`; contributorVisible = { ...contributorVisible, [sk]: (contributorVisible[sk] ?? CONTRIBUTOR_COMMIT_PAGE_SIZE) + CONTRIBUTOR_COMMIT_PAGE_SIZE }; }}><span>Load more ({list.length - visible})</span></button>
+											{/if}
+										{/if}
+									</div>
+								{/if}
+							</div>
+						{/each}
+					</div>
+				{/if}
+			</div>
+		{/if}
+	</div>
+{/snippet}
 
 <!-- Tab Bar Snippet -->
 {#snippet tabBar()}
@@ -2540,9 +4412,10 @@ ${bodies}`;
 <!-- Changes list snippet -->
 {#snippet changesList()}
 	{#if activeView === 'changes'}
+		<div class="flex-1 flex flex-col min-h-0 overflow-hidden">
 		<!-- Commit form -->
 		<CommitForm
-			stagedCount={gitStatus.staged.length}
+			stagedCount={mainStagedFiles.length}
 			{isCommitting}
 			onCommit={handleCommit}
 			hasRemotes={remotes.length > 0}
@@ -2556,18 +4429,24 @@ ${bodies}`;
 			{repoBusy}
 			{repoBusyReason}
 			onCreateBranch={createBranch}
-			onPush={handlePush}
-			onPull={handlePull}
+			onPush={() => handlePush()}
+			onPull={() => handlePull()}
 			onMoreAction={handleMoreAction}
 		/>
 
-		<!-- Changes sections -->
-		<div class="flex-1 overflow-y-auto px-1">
-			{#if gitStatus.conflicted.length > 0}
+		<!-- Main repo changes -->
+		<div
+			class="overflow-y-auto px-1 min-h-0"
+			class:flex-none={mainChangesHeight !== undefined}
+			class:flex-1={mainChangesHeight === undefined}
+			style:height={mainChangesHeight ? `${mainChangesHeight}px` : undefined}
+			style:max-height={mainChangesHeight ? `${mainChangesHeight}px` : undefined}
+		>
+			{#if mainConflictedFiles.length > 0}
 				<ChangesSection
 					title="Conflicts"
 					icon="lucide:triangle-alert"
-					files={gitStatus.conflicted}
+					files={mainConflictedFiles}
 					section="conflicted"
 					activeFilePath={activeTab?.filePath ?? null}
 					activeSection={activeTab?.section ?? null}
@@ -2579,7 +4458,7 @@ ${bodies}`;
 			<ChangesSection
 				title="Staged Changes"
 				icon="lucide:circle-check"
-				files={gitStatus.staged}
+				files={mainStagedFiles}
 				section="staged"
 				activeFilePath={activeTab?.filePath ?? null}
 				activeSection={activeTab?.section ?? null}
@@ -2601,7 +4480,7 @@ ${bodies}`;
 			<ChangesSection
 				title="Changes"
 				icon="lucide:file-pen"
-				files={allChanges}
+				files={mainAllChanges}
 				section="unstaged"
 				activeFilePath={activeTab?.filePath ?? null}
 				activeSection={activeTab?.section ?? null}
@@ -2612,12 +4491,20 @@ ${bodies}`;
 				onViewDiff={viewDiff}
 			/>
 
-			{#if totalChanges === 0 && !isLoading}
+			{#if mainStagedFiles.length === 0 && mainAllChanges.length === 0 && mainConflictedFiles.length === 0 && !isLoading && !(branchInfo?.nested?.length)}
 				<div class="flex flex-col items-center justify-center gap-2 py-8 text-slate-500 text-xs">
 					<Icon name="lucide:circle-check" class="w-6 h-6 opacity-30" />
 					<span>Working tree clean</span>
 				</div>
 			{/if}
+		</div>
+
+		<!-- Nested repo changes -->
+		{#if branchInfo?.nested && branchInfo.nested.length > 0}
+			{#each branchInfo.nested as nested (nested.path)}
+				{@render nestedChangesBlock(nested)}
+			{/each}
+		{/if}
 		</div>
 	{:else if activeView === 'log'}
 		{#if selectedCommit}
@@ -2633,23 +4520,38 @@ ${bodies}`;
 				onViewFile={viewCommitFileDiff}
 			/>
 		{:else}
-			<GitLog
-				{commits}
-				isLoading={isLogLoading}
-				hasMore={logHasMore}
-				activeHash={activeTab?.commitHash ?? null}
-				onLoadMore={() => loadLog()}
-				onViewCommit={viewCommitDiff}
-				onCheckoutCommit={checkoutCommit}
-				getRemoteCommitUrl={buildRemoteCommitUrl}
-			/>
+			<div class="flex-1 flex flex-col min-h-0">
+				<div
+					class="min-h-0 flex flex-col"
+					class:flex-none={mainLogHeight !== undefined}
+					class:flex-auto={mainLogHeight === undefined}
+					style:height={mainLogHeight ? `${mainLogHeight}px` : undefined}
+					style:max-height={mainLogHeight ? `${mainLogHeight}px` : undefined}
+				>
+					<GitLog
+						{commits}
+						isLoading={isLogLoading}
+						hasMore={logHasMore}
+						activeHash={activeTab?.commitHash ?? null}
+						onLoadMore={() => loadLog()}
+						onViewCommit={viewCommitDiff}
+						onCheckoutCommit={checkoutCommit}
+						getRemoteCommitUrl={buildRemoteCommitUrl}
+					/>
+				</div>
+				{#if branchInfo?.nested && branchInfo.nested.length > 0}
+					{#each branchInfo.nested as nested (nested.path)}
+						{@render nestedLogBlock(nested)}
+					{/each}
+				{/if}
+			</div>
 		{/if}
 	{:else if activeView === 'branches'}
 		<!-- Branches View -->
 		<div class="flex-1 flex flex-col pt-2 min-h-0">
 			<div class="flex gap-1 px-2 pb-2 flex-shrink-0">
-				<button type="button" class="px-2.5 py-1 text-xs font-medium rounded-md transition-colors cursor-pointer border-none {branchesSubTab === 'local' ? 'bg-violet-500/10 text-violet-600' : 'bg-transparent text-slate-500 hover:text-slate-700 dark:hover:text-slate-300'}" onclick={() => { branchesSubTab = 'local'; showCreateBranchForm = false; newBranchName = ''; }}>Local ({filteredLocalBranches.length})</button>
-				<button type="button" class="px-2.5 py-1 text-xs font-medium rounded-md transition-colors cursor-pointer border-none {branchesSubTab === 'remote' ? 'bg-violet-500/10 text-violet-600' : 'bg-transparent text-slate-500 hover:text-slate-700 dark:hover:text-slate-300'}" onclick={() => branchesSubTab = 'remote'}>Remote ({remotes.length})</button>
+				<button type="button" class="px-2.5 py-1 text-xs font-medium rounded-md transition-colors cursor-pointer border-none {branchesSubTab === 'local' ? 'bg-violet-500/10 text-violet-600' : 'bg-transparent text-slate-500 hover:text-slate-700 dark:hover:text-slate-300'}" onclick={() => { branchesSubTab = 'local'; showCreateBranchForm = false; newBranchName = ''; branchesSearchQuery = ''; }}>Local ({filteredLocalBranches.length})</button>
+				<button type="button" class="px-2.5 py-1 text-xs font-medium rounded-md transition-colors cursor-pointer border-none {branchesSubTab === 'remote' ? 'bg-violet-500/10 text-violet-600' : 'bg-transparent text-slate-500 hover:text-slate-700 dark:hover:text-slate-300'}" onclick={() => { branchesSubTab = 'remote'; branchesSearchQuery = ''; }}>Remote ({remotes.length})</button>
 			</div>
 			<div class="px-2 pb-2 flex-shrink-0">
 				<div class="flex items-center gap-2 py-1.5 px-2.5 bg-slate-100/80 dark:bg-slate-800/80 border border-slate-200 dark:border-slate-800 rounded-lg">
@@ -2660,85 +4562,90 @@ ${bodies}`;
 					{/if}
 				</div>
 			</div>
-			{#if branchesSubTab === 'local'}
-				<div class="px-2 pb-2 flex-shrink-0">
-					{#if showCreateBranchForm}
-						<div class="p-2.5 bg-slate-50 dark:bg-slate-800/50 border border-slate-200 dark:border-slate-700 rounded-lg space-y-2">
-							<input type="text" bind:value={newBranchName} placeholder="New branch name..." class="w-full px-2.5 py-2 text-sm bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded-md text-slate-900 dark:text-slate-100 outline-none focus:border-violet-500/40 focus:ring-1 focus:ring-violet-500/20" onkeydown={(e) => e.key === 'Enter' && handleCreateBranchFromForm()} autofocus />
-							<div class="flex gap-1.5">
-								<button type="button" class="flex-1 px-3 py-1.5 text-xs font-medium rounded-md transition-colors cursor-pointer border-none {newBranchName.trim() ? 'bg-violet-600 text-white hover:bg-violet-700' : 'bg-slate-200 dark:bg-slate-700 text-slate-400 dark:text-slate-500 cursor-not-allowed'}" onclick={handleCreateBranchFromForm} disabled={!newBranchName.trim()}>Create Branch</button>
-								<button type="button" class="px-3 py-1.5 text-xs font-medium bg-transparent border border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-400 rounded-md hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors cursor-pointer" onclick={() => { showCreateBranchForm = false; newBranchName = ''; }}>Cancel</button>
+			<div class="flex-1 flex flex-col min-h-0">
+				{#if branchesSubTab === 'local'}
+					<div class="flex-1 flex flex-col min-h-0">
+						<div class="px-2 pb-2 flex-shrink-0">
+							{#if showCreateBranchForm}
+								<div class="p-2.5 bg-slate-50 dark:bg-slate-800/50 border border-slate-200 dark:border-slate-700 rounded-lg space-y-2">
+								<input type="text" bind:value={newBranchName} placeholder="New branch name..." class="w-full px-2.5 py-2 text-sm bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded-md text-slate-900 dark:text-slate-100 outline-none focus:border-violet-500/40 focus:ring-1 focus:ring-violet-500/20" onkeydown={(e) => e.key === 'Enter' && handleCreateBranchFromForm()} autofocus />
+								<div class="flex gap-1.5">
+									<button type="button" class="flex-1 px-3 py-1.5 text-xs font-medium rounded-md transition-colors cursor-pointer border-none {newBranchName.trim() ? 'bg-violet-600 text-white hover:bg-violet-700' : 'bg-slate-200 dark:bg-slate-700 text-slate-400 dark:text-slate-500 cursor-not-allowed'}" onclick={handleCreateBranchFromForm} disabled={!newBranchName.trim()}>Create Branch</button>
+									<button type="button" class="px-3 py-1.5 text-xs font-medium bg-transparent border border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-400 rounded-md hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors cursor-pointer" onclick={() => { showCreateBranchForm = false; newBranchName = ''; }}>Cancel</button>
+								</div>
 							</div>
-						</div>
-					{:else}
-						<button type="button" class="flex items-center justify-center gap-2 w-full py-2 px-3 border border-dashed border-slate-300 dark:border-slate-600 rounded-lg text-xs text-slate-500 hover:text-violet-600 hover:border-violet-400 transition-colors cursor-pointer bg-transparent" onclick={() => showCreateBranchForm = true}><Icon name="lucide:plus" class="w-3.5 h-3.5" /><span>Create New Branch</span></button>
-					{/if}
-				</div>
-				<div class="flex-1 overflow-y-auto px-2">
-					{#if !branchInfo}
-						<div class="flex items-center justify-center py-8"><div class="w-5 h-5 border-2 border-slate-200 dark:border-slate-700 border-t-violet-600 rounded-full animate-spin"></div></div>
-					{:else if filteredLocalBranches.length === 0}
-						<div class="flex flex-col items-center justify-center gap-2 py-8 text-slate-500 text-xs"><Icon name="lucide:git-branch" class="w-6 h-6 opacity-30" /><span>{branchesSearchQuery ? 'No branches match your search' : 'No branches'}</span></div>
-					{:else}
-						<div class="space-y-0.5">
-							{#each filteredLocalBranches as branch (branch.name)}
-								{@const upstreamName = getBranchRemoteName(branch)}
-								{@const isExpanded = expandedBranches.has(branch.name)}
-								{@const commitState = branchCommitState[branch.name]}
-								{@const branchRelativeDate = formatRelativeTime(branch.lastCommitDate)}
-								<div>
-									<div
-										class="group relative flex items-center gap-1.5 pl-1.5 pr-2.5 py-1.5 rounded-md transition-colors border cursor-pointer {branch.isCurrent ? 'bg-violet-500/10 border-violet-500/20 text-violet-700 dark:text-violet-300' : 'border-transparent hover:bg-slate-100 dark:hover:bg-slate-800/60 text-slate-700 dark:text-slate-300'}"
-										role="button"
-										tabindex="0"
-										onclick={() => toggleBranchExpanded(branch.name)}
-										onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleBranchExpanded(branch.name); } }}
-									>
-										<Icon name={isExpanded ? 'lucide:chevron-down' : 'lucide:chevron-right'} class="w-3.5 h-3.5 shrink-0 {branch.isCurrent ? 'text-violet-500' : 'text-slate-400'}" />
-										<div class="flex-1 min-w-0 flex flex-col justify-center overflow-hidden pr-2 {!branch.isCurrent ? (pushedBranchNames.has(branch.name) ? 'group-hover:pr-24' : 'group-hover:pr-32') : ''} transition-[padding] duration-150">
-											<div class="flex min-w-0 items-center gap-2">
-												<span class="flex-1 min-w-0 text-sm text-slate-900 dark:text-slate-100 leading-tight truncate" title={branch.name}>{branch.name}</span>
-												{#if upstreamName}<span class="text-3xs text-slate-400 shrink-0">{upstreamName}</span>{/if}
+						{:else}
+							<button type="button" class="flex items-center justify-center gap-2 w-full py-2 px-3 border border-dashed border-slate-300 dark:border-slate-600 rounded-lg text-xs text-slate-500 hover:text-violet-600 hover:border-violet-400 transition-colors cursor-pointer bg-transparent" onclick={() => showCreateBranchForm = true}><Icon name="lucide:plus" class="w-3.5 h-3.5" /><span>Create New Branch</span></button>
+						{/if}
+					</div>
+						<div
+							class="min-h-0 overflow-y-auto px-2"
+							class:flex-none={mainBranchesHeight !== undefined}
+							class:flex-auto={mainBranchesHeight === undefined}
+							style:height={mainBranchesHeight ? `${mainBranchesHeight}px` : undefined}
+							style:max-height={mainBranchesHeight ? `${mainBranchesHeight}px` : undefined}
+						>
+						{#if !branchInfo}
+							<div class="flex items-center justify-center py-8"><div class="w-5 h-5 border-2 border-slate-200 dark:border-slate-700 border-t-violet-600 rounded-full animate-spin"></div></div>
+						{:else if filteredLocalBranches.length === 0}
+							<div class="flex flex-col items-center justify-center gap-2 py-8 text-slate-500 text-xs"><Icon name="lucide:git-branch" class="w-6 h-6 opacity-30" /><span>{branchesSearchQuery ? 'No branches match your search' : 'No branches'}</span></div>
+						{:else}
+							<div class="space-y-0.5">
+								{#each filteredLocalBranches as branch (branch.name)}
+									{@const upstreamName = getBranchRemoteName(branch)}
+									{@const isExpanded = expandedBranches.has(branch.name)}
+									{@const commitState = branchCommitState[branch.name]}
+									{@const branchRelativeDate = formatRelativeTime(branch.lastCommitDate)}
+									<div>
+										<div
+											class="group relative flex items-center gap-1.5 pl-1.5 pr-2.5 py-1.5 rounded-md transition-colors border cursor-pointer select-none {branch.isCurrent ? 'bg-violet-500/10 border-violet-500/20 text-violet-700 dark:text-violet-300' : 'border-transparent hover:bg-slate-100 dark:hover:bg-slate-800/60 text-slate-700 dark:text-slate-300'}"
+											role="button"
+											tabindex="0"
+											onclick={() => toggleBranchExpanded(branch.name)}
+											onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleBranchExpanded(branch.name); } }}
+										>
+											<Icon name={isExpanded ? 'lucide:chevron-down' : 'lucide:chevron-right'} class="w-3.5 h-3.5 shrink-0 {branch.isCurrent ? 'text-violet-500' : 'text-slate-400'}" />
+											<div class="flex-1 min-w-0 flex flex-col justify-center overflow-hidden pr-2 {!branch.isCurrent ? (pushedBranchNames.has(branch.name) ? 'group-hover:pr-24' : 'group-hover:pr-32') : ''} transition-[padding] duration-150">
+												<div class="flex min-w-0 items-center gap-2">
+													<span class="flex-1 min-w-0 text-sm text-slate-900 dark:text-slate-100 leading-tight truncate" title={branch.name}>{branch.name}</span>
+													{#if upstreamName}<span class="text-3xs text-slate-400 shrink-0">{upstreamName}</span>{/if}
+												</div>
+												<div class="flex min-w-0 items-center gap-1.5 mt-0.5 text-xs text-slate-500 leading-tight">
+													{#if branch.ahead > 0}<span class="shrink-0">{branch.ahead} ahead</span>{/if}
+													{#if branch.behind > 0}<span class="shrink-0">{branch.behind} behind</span>{/if}
+													{#if branch.lastCommit}<span class="min-w-0 truncate">{branch.lastCommit}</span>{/if}
+													{#if branchRelativeDate}<span class="shrink-0 whitespace-nowrap">·&nbsp;{branchRelativeDate}</span>{/if}
+												</div>
 											</div>
-											<div class="flex min-w-0 items-center gap-1.5 mt-0.5 text-xs text-slate-500 leading-tight">
-												{#if branch.ahead > 0}<span class="shrink-0">{branch.ahead} ahead</span>{/if}
-												{#if branch.behind > 0}<span class="shrink-0">{branch.behind} behind</span>{/if}
-												{#if branch.lastCommit}<span class="min-w-0 truncate">{branch.lastCommit}</span>{/if}
-												{#if branchRelativeDate}<span class="shrink-0 whitespace-nowrap">·&nbsp;{branchRelativeDate}</span>{/if}
-											</div>
-										</div>
-										{#if !branch.isCurrent}
-										<div class="pointer-events-none absolute inset-y-0 right-0 flex items-center gap-1 pl-1 pr-2 bg-white/20 opacity-0 backdrop-blur-md supports-[backdrop-filter]:bg-white/10 transition-opacity group-hover:opacity-100 dark:bg-slate-900/20 dark:supports-[backdrop-filter]:bg-slate-900/10">
-											<button type="button" class="pointer-events-auto flex items-center justify-center w-7 h-7 rounded-md text-slate-400 hover:bg-violet-500/10 hover:text-violet-500 transition-colors bg-transparent border-none cursor-pointer" onclick={(e) => { e.stopPropagation(); switchBranch(branch.name); }} title="Switch to this branch"><Icon name="lucide:arrow-right" class="w-3.5 h-3.5" /></button>
-											{#if !pushedBranchNames.has(branch.name)}
-												{#if pushingBranch === branch.name}
-													<div class="pointer-events-auto flex items-center justify-center w-7 h-7 rounded-md text-emerald-500"><Icon name="lucide:loader-circle" class="w-3.5 h-3.5 animate-spin" /></div>
-												{:else}
-													<button type="button" class="pointer-events-auto flex items-center justify-center w-7 h-7 rounded-md text-slate-400 hover:bg-emerald-500/10 hover:text-emerald-500 transition-colors bg-transparent border-none cursor-pointer" onclick={(e) => { e.stopPropagation(); handlePushBranch(branch.name); }} title="Push branch to remote"><Icon name="lucide:upload" class="w-3.5 h-3.5" /></button>
+											{#if !branch.isCurrent}
+											<div class="pointer-events-none absolute inset-y-0 right-0 flex items-center gap-1 pl-1 pr-2 bg-white/20 opacity-0 backdrop-blur-md supports-[backdrop-filter]:bg-white/10 transition-opacity group-hover:opacity-100 dark:bg-slate-900/20 dark:supports-[backdrop-filter]:bg-slate-900/10">
+												<button type="button" class="pointer-events-auto flex items-center justify-center w-7 h-7 rounded-md text-slate-400 hover:bg-violet-500/10 hover:text-violet-500 transition-colors bg-transparent border-none cursor-pointer" onclick={(e) => { e.stopPropagation(); switchBranch(branch.name); }} title="Switch to this branch"><Icon name="lucide:arrow-right" class="w-3.5 h-3.5" /></button>
+												{#if !pushedBranchNames.has(branch.name)}
+													{#if pushingBranch === branch.name}
+														<div class="pointer-events-auto flex items-center justify-center w-7 h-7 rounded-md text-emerald-500"><Icon name="lucide:loader-circle" class="w-3.5 h-3.5 animate-spin" /></div>
+													{:else}
+														<button type="button" class="pointer-events-auto flex items-center justify-center w-7 h-7 rounded-md text-slate-400 hover:bg-emerald-500/10 hover:text-emerald-500 transition-colors bg-transparent border-none cursor-pointer" onclick={(e) => { e.stopPropagation(); handlePushBranch(branch.name); }} title="Push branch to remote"><Icon name="lucide:upload" class="w-3.5 h-3.5" /></button>
+													{/if}
 												{/if}
-											{/if}
-											<button type="button" class="pointer-events-auto flex items-center justify-center w-7 h-7 rounded-md text-slate-400 hover:bg-blue-500/10 hover:text-blue-500 transition-colors bg-transparent border-none cursor-pointer" onclick={(e) => { e.stopPropagation(); mergeBranch(branch.name); }} title="Merge into current branch"><Icon name="lucide:git-merge" class="w-3.5 h-3.5" /></button>
-											<button type="button" class="pointer-events-auto flex items-center justify-center w-7 h-7 rounded-md text-slate-400 hover:bg-red-500/10 hover:text-red-500 transition-colors bg-transparent border-none cursor-pointer" onclick={(e) => { e.stopPropagation(); deleteBranch(branch.name); }} title="Delete branch"><Icon name="lucide:trash-2" class="w-3.5 h-3.5" /></button>
+												<button type="button" class="pointer-events-auto flex items-center justify-center w-7 h-7 rounded-md text-slate-400 hover:bg-blue-500/10 hover:text-blue-500 transition-colors bg-transparent border-none cursor-pointer" onclick={(e) => { e.stopPropagation(); mergeBranch(branch.name); }} title="Merge into current branch"><Icon name="lucide:git-merge" class="w-3.5 h-3.5" /></button>
+												<button type="button" class="pointer-events-auto flex items-center justify-center w-7 h-7 rounded-md text-slate-400 hover:bg-red-500/10 hover:text-red-500 transition-colors bg-transparent border-none cursor-pointer" onclick={(e) => { e.stopPropagation(); deleteBranch(branch.name); }} title="Delete branch"><Icon name="lucide:trash-2" class="w-3.5 h-3.5" /></button>
 										</div>
 										{/if}
-										<!-- Push button: only for the active branch when it has not
-										     yet been pushed to the remote -->
-										{#if branch.isCurrent && !pushedBranchNames.has(branch.name)}
-											<button type="button" class="ml-1 flex items-center justify-center w-7 h-7 rounded-md text-slate-400 hover:bg-emerald-500/10 hover:text-emerald-500 transition-colors bg-transparent border-none cursor-pointer shrink-0" onclick={(e) => { e.stopPropagation(); handlePushBranch(branch.name); }} title="Push branch to remote"><Icon name="lucide:upload" class="w-3.5 h-3.5" /></button>
-										{/if}
-									</div>
-									{#if isExpanded}
-										<div class="ml-5 mt-0.5 mb-1 border-l border-slate-200 dark:border-slate-700 pl-2 space-y-0.5">
-											{#if commitState?.isLoading && commitState.commits.length === 0}
-												<div class="flex items-center gap-2 py-2 text-xs text-slate-400"><div class="w-3 h-3 border border-slate-400 border-t-transparent rounded-full animate-spin"></div><span>Loading commits...</span></div>
-											{:else if !commitState || commitState.commits.length === 0}
-												<div class="py-2 text-xs text-slate-400">No commits</div>
-											{:else}
-												{#each commitState.commits as commit (commit.hash)}
-													{@const commitExpanded = expandedBranchCommits.has(commit.hash)}
-													{@const filesState = branchCommitFileState[commit.hash]}
-													{@const commitRelativeDate = formatRelativeTime(commit.date)}
-													<div>
+										</div>
+										{#if isExpanded}
+											<div class="ml-5 mt-0.5 mb-1 border-l border-slate-200 dark:border-slate-700 pl-2 space-y-0.5">
+												{#if commitState?.isLoading && commitState.commits.length === 0}
+													<div class="flex items-center gap-2 py-2 text-xs text-slate-400"><div class="w-3 h-3 border border-slate-400 border-t-transparent rounded-full animate-spin"></div><span>Loading commits...</span></div>
+												{:else if !commitState || commitState.commits.length === 0}
+													<div class="py-2 text-xs text-slate-400">No commits</div>
+												{:else}
+											{#each commitState.commits as commit, i (commit.hash)}
+												{@const commitExpanded = expandedBranchCommits.has(commit.hash)}
+												{@const filesState = branchCommitFileState[commit.hash]}
+												{@const commitRelativeDate = formatRelativeTime(commit.date)}
+												{@const showHeadPush = branch.isCurrent && i === 0 && (!pushedBranchNames.has(branch.name) || (branchInfo?.ahead ?? 0) > 0)}
+												{@const headActionCount = !branch.isCurrent ? 2 : (i === 0 ? (showHeadPush || pushingBranch === branch.name ? 3 : 2) : 1)}
+												<div>
 														<div
 															class="group/commit relative flex items-center gap-1.5 w-full px-2 py-1.5 rounded-md hover:bg-slate-100 dark:hover:bg-slate-800/60 transition-colors cursor-pointer"
 															role="button"
@@ -2747,7 +4654,7 @@ ${bodies}`;
 															onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleBranchCommitExpanded(commit.hash); } }}
 														>
 															<Icon name={commitExpanded ? 'lucide:chevron-down' : 'lucide:chevron-right'} class="w-3 h-3 shrink-0 text-slate-400" />
-															<div class="flex-1 min-w-0 flex flex-col justify-center overflow-hidden pr-2 {branch.name !== branchInfo?.current ? 'group-hover/commit:pr-9' : ''} transition-[padding] duration-150">
+															<div class="flex-1 min-w-0 flex flex-col justify-center overflow-hidden pr-2 {headActionCount === 1 ? 'group-hover/commit:pr-9' : headActionCount === 2 ? 'group-hover/commit:pr-16' : 'group-hover/commit:pr-24'} transition-[padding] duration-150">
 																<div class="flex min-w-0 items-center gap-2">
 																	<span class="flex-1 min-w-0 text-sm text-slate-700 dark:text-slate-300 leading-tight truncate" title={commit.message}>{commit.message}</span>
 																	{#if commitRelativeDate}<span class="text-3xs text-slate-400 shrink-0">{commitRelativeDate}</span>{/if}
@@ -2757,38 +4664,59 @@ ${bodies}`;
 																	{#if commit.author}<span class="flex-1 min-w-0 text-xs text-slate-500 truncate">{commit.author}</span>{/if}
 																</div>
 															</div>
-															{#if branch.name !== branchInfo?.current}
-																<button type="button" class="absolute right-1.5 top-1/2 -translate-y-1/2 flex items-center justify-center w-7 h-7 rounded-md text-slate-400 hover:text-emerald-500 hover:bg-emerald-500/10 transition-colors bg-transparent border-none cursor-pointer shrink-0 opacity-0 group-hover/commit:opacity-100" onclick={(e) => { e.stopPropagation(); handleCherryPick(commit.hash); }} title="Cherry-pick this commit onto {branchInfo?.current}"><Icon name="lucide:git-fork" class="w-4 h-4" /></button>
+														<div class="absolute right-1.5 top-1/2 -translate-y-1/2 flex items-center gap-0.5 shrink-0 opacity-0 group-hover/commit:opacity-100">
+															<button type="button" class="flex items-center justify-center w-7 h-7 rounded-md text-slate-400 hover:text-violet-500 hover:bg-violet-500/10 transition-colors bg-transparent border-none cursor-pointer" onclick={(e) => { e.stopPropagation(); handleViewCommitDiffs(commit); }} title="View all file diffs in this commit"><Icon name="lucide:file-diff" class="w-4 h-4" /></button>
+															{#if !branch.isCurrent}
+																<button type="button" class="flex items-center justify-center w-7 h-7 rounded-md text-slate-400 hover:text-emerald-500 hover:bg-emerald-500/10 transition-colors bg-transparent border-none cursor-pointer" onclick={(e) => { e.stopPropagation(); handleCherryPick(commit.hash); }} title="Cherry-pick this commit onto {branchInfo?.current}"><Icon name="lucide:git-fork" class="w-4 h-4" /></button>
+															{:else if i === 0}
+																{#if pushingBranch === branch.name}
+																	<div class="flex items-center justify-center w-7 h-7 text-slate-400"><Icon name="lucide:loader-circle" class="w-4 h-4 animate-spin" /></div>
+																{:else if showHeadPush}
+																	{@const isDiverged = pushedBranchNames.has(branch.name) && (branchInfo?.ahead ?? 0) > 0 && (branchInfo?.behind ?? 0) > 0}
+																	<button type="button" class="flex items-center justify-center w-7 h-7 rounded-md text-slate-400 hover:bg-emerald-500/10 hover:text-emerald-500 transition-colors bg-transparent border-none cursor-pointer" onclick={(e) => { e.stopPropagation(); handlePushFromBranchList(branch); }} title={isDiverged ? `Force push ${branch.name} to ${selectedRemote} (diverged: ${branchInfo?.ahead} ahead, ${branchInfo?.behind} behind)` : `Push ${branch.name} to remote`}><Icon name="lucide:upload" class="w-4 h-4 {isDiverged ? 'text-amber-500' : ''}" /></button>
+																{/if}
+																<button type="button" class="flex items-center justify-center w-7 h-7 rounded-md text-slate-400 hover:text-amber-500 hover:bg-amber-500/10 transition-colors bg-transparent border-none cursor-pointer" onclick={(e) => { e.stopPropagation(); handleUndoHeadCommit(commit, branch); }} title="Undo this commit (keep changes staged){pushedBranchNames.has(branch.name) && branch.ahead === 0 ? ' · force push needed after' : ''}"><Icon name="lucide:undo-2" class="w-4 h-4" /></button>
 															{/if}
 														</div>
-														{#if commitExpanded}
-															<div class="ml-5 mb-1 border-l border-slate-200 dark:border-slate-700 pl-2 space-y-0.5">
-																{#if filesState?.isLoading && filesState.files.length === 0}
-																	<div class="flex items-center gap-2 py-1.5 text-xs text-slate-400"><div class="w-3 h-3 border border-slate-400 border-t-transparent rounded-full animate-spin"></div><span>Loading files...</span></div>
-																{:else if !filesState || filesState.files.length === 0}
-																	<div class="py-1.5 text-xs text-slate-400">No files</div>
-																{:else}
-																	{#each filesState.files as file (`${commit.hash}:${file.oldPath}:${file.newPath}`)}
-																		{@const filePath = file.newPath || file.oldPath}
-																		{@const fileParts = splitPath(filePath)}
-																		<button type="button" class="group/file flex items-center gap-2 w-full px-2 py-1.5 rounded-md text-left hover:bg-slate-100 dark:hover:bg-slate-800/60 transition-colors bg-transparent border-none cursor-pointer" onclick={() => viewCommitFileDiff(file, 0, commit.hash)} title={filePath}><Icon name={getFileIcon(fileParts.fileName) as IconName} class="w-4 h-4 shrink-0" /><div class="flex items-baseline gap-1.5 min-w-0 flex-1"><span class="text-sm text-slate-600 dark:text-slate-300 truncate">{fileParts.fileName}</span>{#if fileParts.dirPath}<span class="text-2xs text-slate-400 dark:text-slate-500 truncate min-w-0" dir="rtl">{fileParts.dirPath}</span>{/if}</div><span class="w-4 text-center text-sm font-bold {getGitStatusColor(file.status)} shrink-0">{getGitStatusLabel(file.status)}</span></button>
-																	{/each}
-																{/if}
 															</div>
-														{/if}
-													</div>
-												{/each}
-												{#if commitState.hasMore}<button type="button" class="flex items-center justify-center gap-2 w-full px-2 py-1.5 text-xs rounded-md text-slate-500 hover:text-violet-500 hover:bg-slate-100 dark:hover:bg-slate-800/60 transition-colors bg-transparent border-none cursor-pointer disabled:opacity-50" onclick={() => loadBranchCommits(branch.name)} disabled={commitState.isLoading}>{#if commitState.isLoading}<div class="w-3 h-3 border border-slate-400 border-t-transparent rounded-full animate-spin"></div>{/if}<span>Load more</span></button>{/if}
-											{/if}
-										</div>
-									{/if}
-								</div>
-							{/each}
-						</div>
+															{#if commitExpanded}
+																<div class="ml-5 mb-1 border-l border-slate-200 dark:border-slate-700 pl-2 space-y-0.5">
+																	{#if filesState?.isLoading && filesState.files.length === 0}
+																		<div class="flex items-center gap-2 py-1.5 text-xs text-slate-400"><div class="w-3 h-3 border border-slate-400 border-t-transparent rounded-full animate-spin"></div><span>Loading files...</span></div>
+																	{:else if !filesState || filesState.files.length === 0}
+																		<div class="py-1.5 text-xs text-slate-400">No files</div>
+																	{:else}
+																		{#each filesState.files as file (`${commit.hash}:${file.oldPath}:${file.newPath}`)}
+																			{@const filePath = file.newPath || file.oldPath}
+																			{@const fileParts = splitPath(filePath)}
+																			<button type="button" class="group/file flex items-center gap-2 w-full px-2 py-1.5 rounded-md text-left hover:bg-slate-100 dark:hover:bg-slate-800/60 transition-colors bg-transparent border-none cursor-pointer" onclick={() => viewCommitFileDiff(file, 0, commit.hash)} title={filePath}><Icon name={getFileIcon(fileParts.fileName) as IconName} class="w-4 h-4 shrink-0" /><div class="flex items-baseline gap-1.5 min-w-0 flex-1"><span class="text-sm text-slate-600 dark:text-slate-300 truncate">{fileParts.fileName}</span>{#if fileParts.dirPath}<span class="text-2xs text-slate-400 dark:text-slate-500 truncate min-w-0" dir="rtl">{fileParts.dirPath}</span>{/if}</div><span class="w-4 text-center text-sm font-bold {getGitStatusColor(file.status)} shrink-0">{getGitStatusLabel(file.status)}</span></button>
+																		{/each}
+																	{/if}
+																</div>
+															{/if}
+														</div>
+													{/each}
+													{#if commitState.hasMore}<button type="button" class="flex items-center justify-center gap-2 w-full px-2 py-1.5 text-xs rounded-md text-slate-500 hover:text-violet-500 hover:bg-slate-100 dark:hover:bg-slate-800/60 transition-colors bg-transparent border-none cursor-pointer disabled:opacity-50" onclick={() => loadBranchCommits(branch.name)} disabled={commitState.isLoading}>{#if commitState.isLoading}<div class="w-3 h-3 border border-slate-400 border-t-transparent rounded-full animate-spin"></div>{/if}<span>Load more</span></button>{/if}
+												{/if}
+											</div>
+										{/if}
+									</div>
+								{/each}
+							</div>
+						{/if}
+					</div>
+					{#if branchInfo?.nested && branchInfo.nested.length === 1}
+						{@render nestedRepoBlock(branchInfo.nested[0])}
 					{/if}
 				</div>
 			{:else}
-				<div class="flex-1 overflow-y-auto px-2">
+				<div
+					class="min-h-0 overflow-y-auto px-2"
+					class:flex-none={mainBranchesHeight !== undefined}
+					class:flex-auto={mainBranchesHeight === undefined}
+					style:height={mainBranchesHeight ? `${mainBranchesHeight}px` : undefined}
+					style:max-height={mainBranchesHeight ? `${mainBranchesHeight}px` : undefined}
+				>
 					<div class="pb-2">
 						{#if showAddRemoteForm}
 							<div class="p-2.5 bg-slate-50 dark:bg-slate-800/50 border border-slate-200 dark:border-slate-700 rounded-lg space-y-2">
@@ -2823,7 +4751,7 @@ ${bodies}`;
 											</div>
 										</div>
 									{:else}
-										<div class="group relative flex items-center gap-1.5 pl-1.5 pr-2.5 py-1.5 rounded-md border transition-colors {isActiveRemote ? 'bg-violet-500/10 border-violet-500/20' : 'border-transparent hover:bg-slate-100 dark:hover:bg-slate-800/60'}">
+										<div class="group relative flex items-center gap-1.5 pl-1.5 pr-2.5 py-1.5 rounded-md border transition-colors select-none {isActiveRemote ? 'bg-violet-500/10 border-violet-500/20' : 'border-transparent hover:bg-slate-100 dark:hover:bg-slate-800/60'}">
 											<Icon name="lucide:server" class="w-4 h-4 shrink-0 text-slate-400" />
 											<div class="flex-1 min-w-0 flex flex-col justify-center overflow-hidden pr-2 {isActiveRemote ? 'group-hover:pr-24' : 'group-hover:pr-32'} transition-[padding] duration-150">
 												<div class="flex min-w-0 items-center gap-2">
@@ -2852,7 +4780,7 @@ ${bodies}`;
 												{@const branchRelativeDate = formatRelativeTime(branch.lastCommitDate)}
 												{@const shortName = branch.name.substring(remote.name.length + 1)}
 												{@const isDeleting = deletingRemoteBranch === `${remote.name}/${shortName}`}
-												<div class="group/rb relative flex items-center gap-1.5 px-2 py-1.5 rounded-md hover:bg-slate-100 dark:hover:bg-slate-800/60 transition-colors">
+												<div class="group/rb relative flex items-center gap-1.5 px-2 py-1.5 rounded-md hover:bg-slate-100 dark:hover:bg-slate-800/60 transition-colors select-none">
 													<div class="flex-1 min-w-0 flex flex-col justify-center overflow-hidden pr-2 group-hover/rb:pr-20 transition-[padding] duration-150">
 														<span class="text-sm text-slate-700 dark:text-slate-300 leading-tight truncate" title={branch.name}>{shortName}</span>
 														{#if branchRelativeDate}<span class="text-xs text-slate-500 leading-tight">{branchRelativeDate}</span>{/if}
@@ -2877,7 +4805,16 @@ ${bodies}`;
 						</div>
 					{/if}
 				</div>
+				{#if branchInfo?.nested && branchInfo.nested.length === 1}
+					{@render nestedRepoBlock(branchInfo.nested[0])}
+				{/if}
 			{/if}
+				{#if branchInfo?.nested && branchInfo.nested.length > 1}
+					{#each branchInfo.nested as nested (nested.path)}
+						{@render nestedRepoBlock(nested)}
+					{/each}
+				{/if}
+			</div>
 		</div>
 	{:else if activeView === 'more'}
 		<!-- More View: Tags / Stash / Contributors -->
@@ -2890,266 +4827,317 @@ ${bodies}`;
 
 			{#if moreSubTab === 'tags'}
 			<!-- Tags -->
-			<div class="flex-1 overflow-y-auto">
-				<!-- Create tag button/form -->
-				<div class="px-2 pb-2">
-				{#if showCreateTagForm}
-					<div class="p-2.5 bg-slate-50 dark:bg-slate-800/50 border border-slate-200 dark:border-slate-700 rounded-lg space-y-2">
-						<input
-							type="text"
-							bind:value={newTagName}
-							placeholder="Tag name (e.g. v1.0.0)..."
-							class="w-full px-2.5 py-2 text-sm bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded-md text-slate-900 dark:text-slate-100 outline-none focus:border-violet-500/40 focus:ring-1 focus:ring-violet-500/20"
-							onkeydown={(e) => e.key === 'Enter' && !newTagMessage && handleCreateTag()}
-						/>
-						<input
-							type="text"
-							bind:value={newTagMessage}
-							placeholder="Tag message (optional, makes annotated tag)..."
-							class="w-full px-2.5 py-2 text-sm bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded-md text-slate-900 dark:text-slate-100 outline-none focus:border-violet-500/40 focus:ring-1 focus:ring-violet-500/20"
-							onkeydown={(e) => e.key === 'Enter' && handleCreateTag()}
-						/>
-						<div class="flex gap-1.5">
-							<button
-								type="button"
-								class="flex-1 px-3 py-1.5 text-xs font-medium rounded-md transition-colors cursor-pointer border-none
-									{newTagName.trim()
-										? 'bg-violet-600 text-white hover:bg-violet-700'
-										: 'bg-slate-200 dark:bg-slate-700 text-slate-400 dark:text-slate-500 cursor-not-allowed'}"
-								onclick={handleCreateTag}
-								disabled={!newTagName.trim()}
-							>
-								Create Tag
-							</button>
-							<button
-								type="button"
-								class="px-3 py-1.5 text-xs font-medium bg-transparent border border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-400 rounded-md hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors cursor-pointer"
-								onclick={() => { showCreateTagForm = false; newTagName = ''; newTagMessage = ''; }}
-							>
-								Cancel
-							</button>
-						</div>
-					</div>
-				{:else}
-					<button
-						type="button"
-						class="flex items-center justify-center gap-2 w-full py-2 px-3 border border-dashed border-slate-300 dark:border-slate-600 rounded-lg text-xs text-slate-500 hover:text-violet-600 hover:border-violet-400 transition-colors cursor-pointer bg-transparent"
-						onclick={() => showCreateTagForm = true}
-					>
-						<Icon name="lucide:plus" class="w-3.5 h-3.5" />
-						<span>Create New Tag</span>
-					</button>
-				{/if}
-			</div>
-
-			{#if isTagsLoading}
-				<div class="flex items-center justify-center py-8">
-					<div class="w-5 h-5 border-2 border-slate-200 dark:border-slate-700 border-t-violet-600 rounded-full animate-spin"></div>
-				</div>
-			{:else if tags.length === 0}
-				<div class="flex flex-col items-center justify-center gap-2 py-8 text-slate-500 text-xs">
-					<Icon name="lucide:tag" class="w-6 h-6 opacity-30" />
-					<span>No tags</span>
-				</div>
-			{:else}
-				<div class="space-y-1 px-1">
-					{#each tags as tag (tag.name)}
-						<div class="group flex items-center gap-2 px-2.5 py-2 rounded-md hover:bg-slate-100 dark:hover:bg-slate-800/60 transition-colors">
-							<div class="flex-1 min-w-0">
-								<p class="text-sm font-medium text-slate-900 dark:text-slate-100 truncate">{tag.name}</p>
-								<div class="flex items-center gap-1.5">
+			<div class="flex-1 flex flex-col min-h-0">
+				<div
+					class="overflow-y-auto px-2"
+					class:flex-none={mainTagsHeight !== undefined}
+					class:flex-auto={mainTagsHeight === undefined}
+					style:height={mainTagsHeight ? `${mainTagsHeight}px` : undefined}
+					style:max-height={mainTagsHeight ? `${mainTagsHeight}px` : undefined}
+				>
+					<!-- Create tag button/form -->
+					<div class="pb-2">
+						{#if showCreateTagForm && !tagRepoPath}
+							<div class="p-2.5 bg-slate-50 dark:bg-slate-800/50 border border-slate-200 dark:border-slate-700 rounded-lg space-y-2">
+								<input
+									type="text"
+									bind:value={newTagName}
+									placeholder="Tag name (e.g. v1.0.0)..."
+									class="w-full px-2.5 py-2 text-sm bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded-md text-slate-900 dark:text-slate-100 outline-none focus:border-violet-500/40 focus:ring-1 focus:ring-violet-500/20"
+									onkeydown={(e) => e.key === 'Enter' && !newTagMessage && handleCreateTag()}
+								/>
+								<input
+									type="text"
+									bind:value={newTagMessage}
+									placeholder="Tag message (optional, makes annotated tag)..."
+									class="w-full px-2.5 py-2 text-sm bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded-md text-slate-900 dark:text-slate-100 outline-none focus:border-violet-500/40 focus:ring-1 focus:ring-violet-500/20"
+									onkeydown={(e) => e.key === 'Enter' && handleCreateTag()}
+								/>
+								<div class="flex gap-1.5">
 									<button
 										type="button"
-										class="text-xs font-mono text-slate-400 dark:text-slate-500 hover:text-violet-600 dark:hover:text-violet-400 bg-transparent border-none cursor-pointer p-0 shrink-0 transition-colors"
-										onclick={(e) => copyTagHash(tag.hash, e)}
-										title="Copy tag hash"
-									>{tag.hash.slice(0, 7)}</button>
-									{#if tag.message}
-										<span class="text-xs text-slate-400 dark:text-slate-500 truncate">{tag.message}</span>
-									{/if}
+										class="flex-1 px-3 py-1.5 text-xs font-medium rounded-md transition-colors cursor-pointer border-none
+											{newTagName.trim()
+												? 'bg-violet-600 text-white hover:bg-violet-700'
+												: 'bg-slate-200 dark:bg-slate-700 text-slate-400 dark:text-slate-500 cursor-not-allowed'}"
+										onclick={handleCreateTag}
+										disabled={!newTagName.trim()}
+									>
+										Create Tag
+									</button>
+									<button
+										type="button"
+										class="px-3 py-1.5 text-xs font-medium bg-transparent border border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-400 rounded-md hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors cursor-pointer"
+										onclick={() => { showCreateTagForm = false; newTagName = ''; newTagMessage = ''; tagRepoPath = undefined; }}
+									>
+										Cancel
+									</button>
 								</div>
 							</div>
-							<div class="flex items-center gap-0.5 shrink-0">
-								<button
-									type="button"
-									class="flex items-center justify-center w-7 h-7 rounded-md text-slate-400 hover:bg-blue-500/10 hover:text-blue-500 transition-colors bg-transparent border-none cursor-pointer"
-									onclick={() => handlePushTag(tag.name)}
-									title="Push tag to remote"
-								>
-									<Icon name="lucide:arrow-up-from-line" class="w-3.5 h-3.5" />
-								</button>
-								<button
-									type="button"
-									class="flex items-center justify-center w-7 h-7 rounded-md text-slate-400 hover:bg-red-500/10 hover:text-red-500 transition-colors bg-transparent border-none cursor-pointer"
-									onclick={() => handleDeleteTag(tag.name)}
-									title="Delete tag"
-								>
-									<Icon name="lucide:trash-2" class="w-3.5 h-3.5" />
-								</button>
-							</div>
+						{:else}
+							<button
+								type="button"
+								class="flex items-center justify-center gap-2 w-full py-2 px-3 border border-dashed border-slate-300 dark:border-slate-600 rounded-lg text-xs text-slate-500 hover:text-violet-600 hover:border-violet-400 transition-colors cursor-pointer bg-transparent"
+								onclick={() => { tagRepoPath = undefined; showCreateTagForm = true; }}
+							>
+								<Icon name="lucide:plus" class="w-3.5 h-3.5" />
+								<span>Create New Tag</span>
+							</button>
+						{/if}
+					</div>
+
+					{#if isTagsLoading}
+						<div class="flex items-center justify-center py-8">
+							<div class="w-5 h-5 border-2 border-slate-200 dark:border-slate-700 border-t-violet-600 rounded-full animate-spin"></div>
 						</div>
-					{/each}
+					{:else}
+						{@const mainTags = tags.filter(t => !t.repoPath)}
+						{#if mainTags.length === 0}
+							<div class="flex flex-col items-center justify-center gap-2 py-8 text-slate-500 text-xs">
+								<Icon name="lucide:tag" class="w-6 h-6 opacity-30" />
+								<span>No tags</span>
+							</div>
+						{:else}
+							<div class="space-y-1 pb-2">
+								{#each mainTags as tag (tag.name)}
+									<div class="group flex items-center gap-2 px-2.5 py-2 rounded-md hover:bg-slate-100 dark:hover:bg-slate-800/60 transition-colors">
+										<div class="flex-1 min-w-0">
+											<p class="text-sm font-medium text-slate-900 dark:text-slate-100 truncate">{tag.name}</p>
+											<div class="flex items-center gap-1.5">
+												<button
+													type="button"
+													class="text-xs font-mono text-slate-400 dark:text-slate-500 hover:text-violet-600 dark:hover:text-violet-400 bg-transparent border-none cursor-pointer p-0 shrink-0 transition-colors"
+													onclick={(e) => copyTagHash(tag.hash, e)}
+													title="Copy tag hash"
+												>{tag.hash.slice(0, 7)}</button>
+												{#if tag.message}
+													<span class="text-xs text-slate-400 dark:text-slate-500 truncate">{tag.message}</span>
+												{/if}
+											</div>
+										</div>
+										<div class="flex items-center gap-0.5 shrink-0">
+											<button
+												type="button"
+												class="flex items-center justify-center w-7 h-7 rounded-md text-slate-400 hover:bg-blue-500/10 hover:text-blue-500 transition-colors bg-transparent border-none cursor-pointer"
+												onclick={() => handlePushTag(tag.name)}
+												title="Push tag to remote"
+											>
+												<Icon name="lucide:arrow-up-from-line" class="w-3.5 h-3.5" />
+											</button>
+											<button
+												type="button"
+												class="flex items-center justify-center w-7 h-7 rounded-md text-slate-400 hover:bg-red-500/10 hover:text-red-500 transition-colors bg-transparent border-none cursor-pointer"
+												onclick={() => handleDeleteTag(tag.name)}
+												title="Delete tag"
+											>
+												<Icon name="lucide:trash-2" class="w-3.5 h-3.5" />
+											</button>
+										</div>
+									</div>
+								{/each}
+							</div>
+						{/if}
+					{/if}
 				</div>
-			{/if}
+				{#if branchInfo?.nested && branchInfo.nested.length > 0}
+					{#each branchInfo.nested as nested (nested.path)}
+						{@render nestedTagBlock(nested)}
+					{/each}
+				{/if}
 			</div>
 			{:else if moreSubTab === 'stash'}
 			<!-- Stash -->
-			<div class="flex-1 overflow-y-auto px-2">
-				<div class="pb-2">
-					{#if showStashSaveForm}
-						<div class="p-2.5 bg-slate-50 dark:bg-slate-800/50 border border-slate-200 dark:border-slate-700 rounded-lg space-y-2">
-							<input type="text" data-stash-message-input bind:value={stashMessage} placeholder="Stash message (optional)..." class="w-full px-2.5 py-2 text-sm bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded-md text-slate-900 dark:text-slate-100 outline-none focus:border-violet-500/40 focus:ring-1 focus:ring-violet-500/20" onkeydown={(e) => e.key === 'Enter' && handleStashSave()} />
-							<!-- Scope: stash everything vs. only the staged (index) changes -->
-							<div class="flex gap-1 p-0.5 bg-slate-100 dark:bg-slate-800 rounded-md">
-								<button type="button" class="flex-1 px-2 py-1 text-xs font-medium rounded transition-colors cursor-pointer border-none {!stashStagedOnly ? 'bg-white dark:bg-slate-700 text-slate-900 dark:text-slate-100 shadow-sm' : 'bg-transparent text-slate-500 hover:text-slate-700 dark:hover:text-slate-300'}" onclick={() => stashStagedOnly = false}>All changes</button>
-								<button type="button" class="flex-1 px-2 py-1 text-xs font-medium rounded transition-colors cursor-pointer border-none {stashStagedOnly ? 'bg-white dark:bg-slate-700 text-slate-900 dark:text-slate-100 shadow-sm' : 'bg-transparent text-slate-500 hover:text-slate-700 dark:hover:text-slate-300'}" onclick={() => stashStagedOnly = true}>Staged only</button>
-							</div>
-							<div class="flex gap-1.5"><button type="button" class="flex-1 px-3 py-1.5 text-xs font-medium rounded-md bg-violet-600 text-white hover:bg-violet-700 transition-colors cursor-pointer border-none" onclick={handleStashSave}>Stash Changes</button><button type="button" class="px-3 py-1.5 text-xs font-medium bg-transparent border border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-400 rounded-md hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors cursor-pointer" onclick={() => { showStashSaveForm = false; stashMessage = ''; stashStagedOnly = false; }}>Cancel</button></div>
-						</div>
-					{:else}
-						<button type="button" class="flex items-center justify-center gap-2 w-full py-2 px-3 border border-dashed border-slate-300 dark:border-slate-600 rounded-lg text-xs text-slate-500 hover:text-violet-600 hover:border-violet-400 transition-colors cursor-pointer bg-transparent" onclick={() => { stashStagedOnly = false; showStashSaveForm = true; }}><Icon name="lucide:plus" class="w-3.5 h-3.5" /><span>Stash Current Changes</span></button>
-					{/if}
-				</div>
-				{#if isStashLoading}
-					<div class="flex items-center justify-center py-8"><div class="w-5 h-5 border-2 border-slate-200 dark:border-slate-700 border-t-violet-600 rounded-full animate-spin"></div></div>
-				{:else if stashEntries.length === 0}
-					<div class="flex flex-col items-center justify-center gap-2 py-8 text-slate-500 text-xs"><Icon name="lucide:archive" class="w-6 h-6 opacity-30" /><span>No stashed changes</span></div>
-				{:else}
-					<div class="space-y-0.5">
-						{#each stashEntries as entry (entry.index)}
-							{@const relativeDate = formatRelativeTime(entry.date)}
-							{@const stashExpanded = expandedStashes.has(entry.index)}
-							{@const sFiles = stashFileState[entry.index]}
-							<div>
-								<div
-									class="group relative flex items-center gap-1.5 pl-1.5 pr-2.5 py-1.5 rounded-md hover:bg-slate-100 dark:hover:bg-slate-800/60 transition-colors cursor-pointer"
-									role="button"
-									tabindex="0"
-									onclick={() => toggleStashExpanded(entry.index)}
-									onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleStashExpanded(entry.index); } }}
-								>
-									<Icon name={stashExpanded ? 'lucide:chevron-down' : 'lucide:chevron-right'} class="w-3.5 h-3.5 shrink-0 text-slate-400" />
-									<div class="flex-1 min-w-0 pr-2 group-hover:pr-16 flex flex-col justify-center overflow-hidden transition-[padding] duration-150">
-										<p class="text-sm font-medium text-slate-900 dark:text-slate-100 truncate">{entry.message}</p>
-										<p class="text-xs text-slate-400 dark:text-slate-500"><span>stash@&#123;{entry.index}&#125;</span>{#if relativeDate}<span class="mx-1">·</span><span>{relativeDate}</span>{/if}</p>
-									</div>
-									<div class="pointer-events-none absolute inset-y-0 right-0 flex items-center gap-1 pl-1 pr-2 bg-white/20 opacity-0 backdrop-blur-md supports-[backdrop-filter]:bg-white/10 transition-opacity group-hover:opacity-100 dark:bg-slate-900/20 dark:supports-[backdrop-filter]:bg-slate-900/10">
-										<button type="button" class="pointer-events-auto flex items-center justify-center w-7 h-7 rounded-md text-slate-400 hover:bg-emerald-500/10 hover:text-emerald-500 transition-colors bg-transparent border-none cursor-pointer" onclick={(e) => { e.stopPropagation(); handleStashPop(entry.index); }} title="Pop"><Icon name="lucide:archive-restore" class="w-3.5 h-3.5" /></button>
-										<button type="button" class="pointer-events-auto flex items-center justify-center w-7 h-7 rounded-md text-slate-400 hover:bg-red-500/10 hover:text-red-500 transition-colors bg-transparent border-none cursor-pointer" onclick={(e) => { e.stopPropagation(); handleStashDrop(entry.index); }} title="Drop"><Icon name="lucide:trash-2" class="w-3.5 h-3.5" /></button>
-									</div>
+			<div class="flex-1 flex flex-col min-h-0">
+				<div
+					class="overflow-y-auto px-2"
+					class:flex-none={mainStashHeight !== undefined}
+					class:flex-auto={mainStashHeight === undefined}
+					style:height={mainStashHeight ? `${mainStashHeight}px` : undefined}
+					style:max-height={mainStashHeight ? `${mainStashHeight}px` : undefined}
+				>
+					<div class="pb-2">
+						{#if showStashSaveForm && !stashRepoPath}
+							<div class="p-2.5 bg-slate-50 dark:bg-slate-800/50 border border-slate-200 dark:border-slate-700 rounded-lg space-y-2">
+								<input type="text" data-stash-message-input bind:value={stashMessage} placeholder="Stash message (optional)..." class="w-full px-2.5 py-2 text-sm bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded-md text-slate-900 dark:text-slate-100 outline-none focus:border-violet-500/40 focus:ring-1 focus:ring-violet-500/20" onkeydown={(e) => e.key === 'Enter' && handleStashSave()} />
+								<!-- Scope: stash everything vs. only the staged (index) changes -->
+								<div class="flex gap-1 p-0.5 bg-slate-100 dark:bg-slate-800 rounded-md">
+									<button type="button" class="flex-1 px-2 py-1 text-xs font-medium rounded transition-colors cursor-pointer border-none {!stashStagedOnly ? 'bg-white dark:bg-slate-700 text-slate-900 dark:text-slate-100 shadow-sm' : 'bg-transparent text-slate-500 hover:text-slate-700 dark:hover:text-slate-300'}" onclick={() => stashStagedOnly = false}>All changes</button>
+									<button type="button" class="flex-1 px-2 py-1 text-xs font-medium rounded transition-colors cursor-pointer border-none {stashStagedOnly ? 'bg-white dark:bg-slate-700 text-slate-900 dark:text-slate-100 shadow-sm' : 'bg-transparent text-slate-500 hover:text-slate-700 dark:hover:text-slate-300'}" onclick={() => stashStagedOnly = true}>Staged only</button>
 								</div>
-								{#if stashExpanded}
-									<div class="ml-5 mt-0.5 mb-1 border-l border-slate-200 dark:border-slate-700 pl-2 space-y-0.5">
-										{#if sFiles?.isLoading && sFiles.files.length === 0}
-											<div class="flex items-center gap-2 py-1.5 text-xs text-slate-400"><div class="w-3 h-3 border border-slate-400 border-t-transparent rounded-full animate-spin"></div><span>Loading files...</span></div>
-										{:else if !sFiles || sFiles.files.length === 0}
-											<div class="py-1.5 text-xs text-slate-400">No files</div>
-										{:else}
-											{#each sFiles.files as file (`${entry.index}:${file.oldPath}:${file.newPath}`)}
-												{@const filePath = file.newPath || file.oldPath}
-												{@const fileParts = splitPath(filePath)}
-												<button type="button" class="flex items-center gap-2 w-full px-2 py-1.5 rounded-md text-left hover:bg-slate-100 dark:hover:bg-slate-800/60 transition-colors bg-transparent border-none cursor-pointer" onclick={() => viewStashFileDiff(file, entry.index)} title={filePath}><Icon name={getFileIcon(fileParts.fileName) as IconName} class="w-4 h-4 shrink-0" /><div class="flex items-baseline gap-1.5 min-w-0 flex-1"><span class="text-sm text-slate-600 dark:text-slate-300 truncate">{fileParts.fileName}</span>{#if fileParts.dirPath}<span class="text-2xs text-slate-400 dark:text-slate-500 truncate min-w-0" dir="rtl">{fileParts.dirPath}</span>{/if}</div><span class="w-4 text-center text-sm font-bold {getGitStatusColor(file.status)} shrink-0">{getGitStatusLabel(file.status)}</span></button>
-											{/each}
+								<div class="flex gap-1.5"><button type="button" class="flex-1 px-3 py-1.5 text-xs font-medium rounded-md bg-violet-600 text-white hover:bg-violet-700 transition-colors cursor-pointer border-none" onclick={handleStashSave}>Stash Changes</button><button type="button" class="px-3 py-1.5 text-xs font-medium bg-transparent border border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-400 rounded-md hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors cursor-pointer" onclick={() => { showStashSaveForm = false; stashMessage = ''; stashStagedOnly = false; stashRepoPath = undefined; }}>Cancel</button></div>
+							</div>
+						{:else}
+							<button type="button" class="flex items-center justify-center gap-2 w-full py-2 px-3 border border-dashed border-slate-300 dark:border-slate-600 rounded-lg text-xs text-slate-500 hover:text-violet-600 hover:border-violet-400 transition-colors cursor-pointer bg-transparent" onclick={() => { stashStagedOnly = false; stashRepoPath = undefined; showStashSaveForm = true; }}><Icon name="lucide:plus" class="w-3.5 h-3.5" /><span>Stash Current Changes</span></button>
+						{/if}
+					</div>
+					{#if isStashLoading}
+						<div class="flex items-center justify-center py-8"><div class="w-5 h-5 border-2 border-slate-200 dark:border-slate-700 border-t-violet-600 rounded-full animate-spin"></div></div>
+					{:else}
+						{@const mainStashEntries = stashEntries.filter(e => !e.repoPath)}
+						{#if mainStashEntries.length === 0}
+							<div class="flex flex-col items-center justify-center gap-2 py-8 text-slate-500 text-xs"><Icon name="lucide:archive" class="w-6 h-6 opacity-30" /><span>No stashed changes</span></div>
+						{:else}
+							<div class="space-y-0.5 pb-2">
+								{#each mainStashEntries as entry (getStashKey(entry))}
+									{@const relativeDate = formatRelativeTime(entry.date)}
+									{@const key = getStashKey(entry)}
+									{@const stashExpanded = expandedStashes.has(key)}
+									{@const sFiles = stashFileState[key]}
+									<div>
+										<div
+											class="group relative flex items-center gap-1.5 pl-1.5 pr-2.5 py-1.5 rounded-md hover:bg-slate-100 dark:hover:bg-slate-800/60 transition-colors cursor-pointer"
+											role="button"
+											tabindex="0"
+											onclick={() => toggleStashExpanded(entry)}
+											onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleStashExpanded(entry); } }}
+										>
+											<Icon name={stashExpanded ? 'lucide:chevron-down' : 'lucide:chevron-right'} class="w-3.5 h-3.5 shrink-0 text-slate-400" />
+											<div class="flex-1 min-w-0 pr-2 group-hover:pr-16 flex flex-col justify-center overflow-hidden transition-[padding] duration-150">
+												<p class="text-sm font-medium text-slate-900 dark:text-slate-100 truncate">{entry.message}</p>
+												<p class="text-xs text-slate-400 dark:text-slate-500">
+													<span>stash@&#123;{entry.index}&#125;</span>
+													{#if relativeDate}
+														<span class="mx-1">·</span><span>{relativeDate}</span>
+													{/if}
+												</p>
+											</div>
+											<div class="pointer-events-none absolute inset-y-0 right-0 flex items-center gap-1 pl-1 pr-2 bg-white/20 opacity-0 backdrop-blur-md supports-[backdrop-filter]:bg-white/10 transition-opacity group-hover:opacity-100 dark:bg-slate-900/20 dark:supports-[backdrop-filter]:bg-slate-900/10">
+												<button type="button" class="pointer-events-auto flex items-center justify-center w-7 h-7 rounded-md text-slate-400 hover:bg-emerald-500/10 hover:text-emerald-500 transition-colors bg-transparent border-none cursor-pointer" onclick={(e) => { e.stopPropagation(); handleStashPop(entry); }} title="Pop"><Icon name="lucide:archive-restore" class="w-3.5 h-3.5" /></button>
+												<button type="button" class="pointer-events-auto flex items-center justify-center w-7 h-7 rounded-md text-slate-400 hover:bg-red-500/10 hover:text-red-500 transition-colors bg-transparent border-none cursor-pointer" onclick={(e) => { e.stopPropagation(); handleStashDrop(entry); }} title="Drop"><Icon name="lucide:trash-2" class="w-3.5 h-3.5" /></button>
+											</div>
+										</div>
+										{#if stashExpanded}
+											<div class="ml-5 mt-0.5 mb-1 border-l border-slate-200 dark:border-slate-700 pl-2 space-y-0.5">
+												{#if sFiles?.isLoading && sFiles.files.length === 0}
+													<div class="flex items-center gap-2 py-1.5 text-xs text-slate-400"><div class="w-3 h-3 border border-slate-400 border-t-transparent rounded-full animate-spin"></div><span>Loading files...</span></div>
+												{:else if !sFiles || sFiles.files.length === 0}
+													<div class="py-1.5 text-xs text-slate-400">No files</div>
+												{:else}
+													{#each sFiles.files as file (`${key}:${file.oldPath}:${file.newPath}`)}
+														{@const filePath = file.newPath || file.oldPath}
+														{@const fileParts = splitPath(filePath)}
+														<button type="button" class="flex items-center gap-2 w-full px-2 py-1.5 rounded-md text-left hover:bg-slate-100 dark:hover:bg-slate-800/60 transition-colors bg-transparent border-none cursor-pointer" onclick={() => viewStashFileDiff(file, entry)} title={filePath}><Icon name={getFileIcon(fileParts.fileName) as IconName} class="w-4 h-4 shrink-0" /><div class="flex items-baseline gap-1.5 min-w-0 flex-1"><span class="text-sm text-slate-600 dark:text-slate-300 truncate">{fileParts.fileName}</span>{#if fileParts.dirPath}<span class="text-2xs text-slate-400 dark:text-slate-500 truncate min-w-0" dir="rtl">{fileParts.dirPath}</span>{/if}</div><span class="w-4 text-center text-sm font-bold {getGitStatusColor(file.status)} shrink-0">{getGitStatusLabel(file.status)}</span></button>
+													{/each}
+												{/if}
+											</div>
 										{/if}
 									</div>
-								{/if}
+								{/each}
 							</div>
-						{/each}
-					</div>
+						{/if}
+					{/if}
+				</div>
+				{#if branchInfo?.nested && branchInfo.nested.length > 0}
+					{#each branchInfo.nested as nested (nested.path)}
+						{@render nestedStashBlock(nested)}
+					{/each}
 				{/if}
 			</div>
 			{:else}
 			<!-- Contributors -->
-			<div class="flex-1 overflow-y-auto px-2">
-				{#if isContributorsLoading}
-					<div class="flex items-center justify-center py-8"><div class="w-5 h-5 border-2 border-slate-200 dark:border-slate-700 border-t-violet-600 rounded-full animate-spin"></div></div>
-				{:else if contributors.length === 0}
-					<div class="flex flex-col items-center justify-center gap-2 py-8 text-slate-500 text-xs"><Icon name="lucide:users" class="w-6 h-6 opacity-30" /><span>No contributors</span></div>
-				{:else}
-					<div class="space-y-0.5">
-						{#each contributors as c, ci (`${c.key}:${ci}`)}
-							{@const expanded = expandedContributors.has(c.key)}
-							{@const share = contributorTotal > 0 ? Math.round((c.count / contributorTotal) * 100) : 0}
-							{@const lastActive = formatRelativeTime(c.lastDate)}
-							<div>
-								<div
-									class="flex items-center gap-2 px-2.5 py-2 rounded-md hover:bg-slate-100 dark:hover:bg-slate-800/60 transition-colors cursor-pointer"
-									role="button"
-									tabindex="0"
-									onclick={() => toggleContributor(c.key)}
-									onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleContributor(c.key); } }}
-								>
-									<Icon name={expanded ? 'lucide:chevron-down' : 'lucide:chevron-right'} class="w-3 h-3 shrink-0 text-slate-400" />
-									<div class="flex-1 min-w-0">
-										<div class="flex items-center gap-2 min-w-0">
-											<p class="flex-1 text-sm text-slate-700 dark:text-slate-300 truncate">{c.name}</p>
-											<span class="text-3xs text-slate-400 shrink-0 tabular-nums">{c.count} commit{c.count === 1 ? '' : 's'}{lastActive ? ` · ${lastActive}` : ''}</span>
-										</div>
-										<p class="text-xs text-slate-400 dark:text-slate-500 truncate">{c.email}</p>
-										<div class="flex items-center gap-2">
-											<div class="flex-1 h-1 rounded-full bg-slate-200/70 dark:bg-slate-700/60 overflow-hidden">
-												<div class="h-full rounded-full bg-violet-500/70" style="width: {share}%"></div>
+			<div class="flex-1 flex flex-col min-h-0">
+				<div
+					class="overflow-y-auto px-2"
+					class:flex-none={mainContributorsHeight !== undefined}
+					class:flex-auto={mainContributorsHeight === undefined}
+					style:height={mainContributorsHeight ? `${mainContributorsHeight}px` : undefined}
+					style:max-height={mainContributorsHeight ? `${mainContributorsHeight}px` : undefined}
+				>
+					{#if isContributorsLoading}
+						<div class="flex items-center justify-center py-8"><div class="w-5 h-5 border-2 border-slate-200 dark:border-slate-700 border-t-violet-600 rounded-full animate-spin"></div></div>
+					{:else if contributors.length === 0}
+						<div class="flex flex-col items-center justify-center gap-2 py-8 text-slate-500 text-xs"><Icon name="lucide:users" class="w-6 h-6 opacity-30" /><span>No contributors</span></div>
+					{:else}
+						<div class="space-y-0.5 pb-2">
+							{#each contributors as c, ci (`${c.key}:${ci}`)}
+								{@const expanded = expandedContributors.has(c.key)}
+								{@const share = contributorTotal > 0 ? Math.round((c.count / contributorTotal) * 100) : 0}
+								{@const lastActive = formatRelativeTime(c.lastDate)}
+								<div>
+									<div
+										class="flex items-center gap-2 px-2.5 py-2 rounded-md hover:bg-slate-100 dark:hover:bg-slate-800/60 transition-colors cursor-pointer"
+										role="button"
+										tabindex="0"
+										onclick={() => toggleContributor(c.key)}
+										onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleContributor(c.key); } }}
+									>
+										<Icon name={expanded ? 'lucide:chevron-down' : 'lucide:chevron-right'} class="w-3 h-3 shrink-0 text-slate-400" />
+										<div class="flex-1 min-w-0">
+											<div class="flex items-center gap-2 min-w-0">
+												<p class="flex-1 text-sm text-slate-700 dark:text-slate-300 truncate">{c.name}</p>
+												<span class="text-3xs text-slate-400 shrink-0 tabular-nums">{c.count} commit{c.count === 1 ? '' : 's'}{lastActive ? ` · ${lastActive}` : ''}</span>
 											</div>
-											<span class="text-3xs text-slate-400 shrink-0 tabular-nums">{share}%</span>
+											<p class="text-xs text-slate-400 dark:text-slate-500 truncate">{c.email}</p>
+											<div class="flex items-center gap-2">
+												<div class="flex-1 h-1 rounded-full bg-slate-200/70 dark:bg-slate-700/60 overflow-hidden">
+													<div class="h-full rounded-full bg-violet-500/70" style="width: {share}%"></div>
+												</div>
+												<span class="text-3xs text-slate-400 shrink-0 tabular-nums">{share}%</span>
+											</div>
 										</div>
 									</div>
-								</div>
-								{#if expanded}
-									{@const list = contributorCommits(c.key)}
-									{@const visible = contributorVisible[c.key] ?? CONTRIBUTOR_COMMIT_PAGE_SIZE}
-									<div class="ml-5 mb-1 border-l border-slate-200 dark:border-slate-700 pl-2 space-y-0.5">
-										{#if list.length === 0}
-											<div class="py-1.5 text-xs text-slate-400">No commits in the sampled history</div>
-										{:else}
-											{#each list.slice(0, visible) as commit (commit.hash)}
-												{@const commitExpanded = expandedBranchCommits.has(commit.hash)}
-												{@const filesState = branchCommitFileState[commit.hash]}
-												{@const rel = formatRelativeTime(commit.date)}
-												<div>
-													<div
-														class="flex items-center gap-1.5 w-full px-2 py-1.5 rounded-md hover:bg-slate-100 dark:hover:bg-slate-800/60 transition-colors cursor-pointer"
-														role="button"
-														tabindex="0"
-														onclick={() => toggleBranchCommitExpanded(commit.hash)}
-														onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleBranchCommitExpanded(commit.hash); } }}
-													>
-														<Icon name={commitExpanded ? 'lucide:chevron-down' : 'lucide:chevron-right'} class="w-3 h-3 shrink-0 text-slate-400" />
-														<div class="flex-1 min-w-0 flex flex-col justify-center overflow-hidden">
-															<div class="flex min-w-0 items-center gap-2">
-																<span class="flex-1 min-w-0 text-sm text-slate-700 dark:text-slate-300 leading-tight truncate" title={commit.message}>{commit.message}</span>
-																{#if rel}<span class="text-3xs text-slate-400 shrink-0">{rel}</span>{/if}
-															</div>
-															<div class="flex min-w-0 items-center gap-1.5 mt-0.5">
-																<button type="button" class="font-mono text-xs text-violet-600 dark:text-violet-400 hover:text-violet-800 dark:hover:text-violet-300 bg-transparent border-none cursor-pointer p-0 shrink-0 transition-colors" onclick={(e) => copyCommitHash(commit.hash, e)} title="Copy commit hash">{commit.hashShort}</button>
+									{#if expanded}
+										{@const list = contributorCommits(c.key)}
+										{@const visible = contributorVisible[c.key] ?? CONTRIBUTOR_COMMIT_PAGE_SIZE}
+										<div class="ml-5 mb-1 border-l border-slate-200 dark:border-slate-700 pl-2 space-y-0.5">
+											{#if list.length === 0}
+												<div class="py-1.5 text-xs text-slate-400">No commits in the sampled history</div>
+											{:else}
+												{#each list.slice(0, visible) as commit (commit.hash)}
+													{@const commitExpanded = expandedBranchCommits.has(commit.hash)}
+													{@const filesState = branchCommitFileState[commit.hash]}
+													{@const rel = formatRelativeTime(commit.date)}
+													<div>
+														<div
+															class="flex items-center gap-1.5 w-full px-2 py-1.5 rounded-md hover:bg-slate-100 dark:hover:bg-slate-800/60 transition-colors cursor-pointer"
+															role="button"
+															tabindex="0"
+															onclick={() => toggleBranchCommitExpanded(commit.hash)}
+															onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleBranchCommitExpanded(commit.hash); } }}
+														>
+															<Icon name={commitExpanded ? 'lucide:chevron-down' : 'lucide:chevron-right'} class="w-3 h-3 shrink-0 text-slate-400" />
+															<div class="flex-1 min-w-0 flex flex-col justify-center overflow-hidden">
+																<div class="flex min-w-0 items-center gap-2">
+																	<span class="flex-1 min-w-0 text-sm text-slate-700 dark:text-slate-300 leading-tight truncate" title={commit.message}>{commit.message}</span>
+																	{#if rel}<span class="text-3xs text-slate-400 shrink-0">{rel}</span>{/if}
+																</div>
+																<div class="flex min-w-0 items-center gap-1.5 mt-0.5">
+																	<button type="button" class="font-mono text-xs text-violet-600 dark:text-violet-400 hover:text-violet-800 dark:hover:text-violet-300 bg-transparent border-none cursor-pointer p-0 shrink-0 transition-colors" onclick={(e) => copyCommitHash(commit.hash, e)} title="Copy commit hash">{commit.hashShort}</button>
+																</div>
 															</div>
 														</div>
+														{#if commitExpanded}
+															<div class="ml-5 mb-1 border-l border-slate-200 dark:border-slate-700 pl-2 space-y-0.5">
+																{#if filesState?.isLoading && filesState.files.length === 0}
+																	<div class="flex items-center gap-2 py-1.5 text-xs text-slate-400"><div class="w-3 h-3 border border-slate-400 border-t-transparent rounded-full animate-spin"></div><span>Loading files...</span></div>
+																{:else if !filesState || filesState.files.length === 0}
+																	<div class="py-1.5 text-xs text-slate-400">No files</div>
+																{:else}
+																	{#each filesState.files as file (`${commit.hash}:${file.oldPath}:${file.newPath}`)}
+																		{@const filePath = file.newPath || file.oldPath}
+																		{@const fileParts = splitPath(filePath)}
+																		<button type="button" class="group/file flex items-center gap-2 w-full px-2 py-1.5 rounded-md text-left hover:bg-slate-100 dark:hover:bg-slate-800/60 transition-colors bg-transparent border-none cursor-pointer" onclick={() => viewCommitFileDiff(file, 0, commit.hash)} title={filePath}><Icon name={getFileIcon(fileParts.fileName) as IconName} class="w-4 h-4 shrink-0" /><div class="flex items-baseline gap-1.5 min-w-0 flex-1"><span class="text-sm text-slate-600 dark:text-slate-300 truncate">{fileParts.fileName}</span>{#if fileParts.dirPath}<span class="text-2xs text-slate-400 dark:text-slate-500 truncate min-w-0" dir="rtl">{fileParts.dirPath}</span>{/if}</div><span class="w-4 text-center text-sm font-bold {getGitStatusColor(file.status)} shrink-0">{getGitStatusLabel(file.status)}</span></button>
+																	{/each}
+																{/if}
+															</div>
+														{/if}
 													</div>
-													{#if commitExpanded}
-														<div class="ml-5 mb-1 border-l border-slate-200 dark:border-slate-700 pl-2 space-y-0.5">
-															{#if filesState?.isLoading && filesState.files.length === 0}
-																<div class="flex items-center gap-2 py-1.5 text-xs text-slate-400"><div class="w-3 h-3 border border-slate-400 border-t-transparent rounded-full animate-spin"></div><span>Loading files...</span></div>
-															{:else if !filesState || filesState.files.length === 0}
-																<div class="py-1.5 text-xs text-slate-400">No files</div>
-															{:else}
-																{#each filesState.files as file (`${commit.hash}:${file.oldPath}:${file.newPath}`)}
-																	{@const filePath = file.newPath || file.oldPath}
-																	{@const fileParts = splitPath(filePath)}
-																	<button type="button" class="group/file flex items-center gap-2 w-full px-2 py-1.5 rounded-md text-left hover:bg-slate-100 dark:hover:bg-slate-800/60 transition-colors bg-transparent border-none cursor-pointer" onclick={() => viewCommitFileDiff(file, 0, commit.hash)} title={filePath}><Icon name={getFileIcon(fileParts.fileName) as IconName} class="w-4 h-4 shrink-0" /><div class="flex items-baseline gap-1.5 min-w-0 flex-1"><span class="text-sm text-slate-600 dark:text-slate-300 truncate">{fileParts.fileName}</span>{#if fileParts.dirPath}<span class="text-2xs text-slate-400 dark:text-slate-500 truncate min-w-0" dir="rtl">{fileParts.dirPath}</span>{/if}</div><span class="w-4 text-center text-sm font-bold {getGitStatusColor(file.status)} shrink-0">{getGitStatusLabel(file.status)}</span></button>
-																{/each}
-															{/if}
-														</div>
-													{/if}
-												</div>
-											{/each}
-											{#if visible < list.length}
-												<button type="button" class="flex items-center justify-center gap-2 w-full px-2 py-1.5 text-xs rounded-md text-slate-500 hover:text-violet-500 hover:bg-slate-100 dark:hover:bg-slate-800/60 transition-colors bg-transparent border-none cursor-pointer" onclick={() => loadMoreContributorCommits(c.key)}><span>Load more ({list.length - visible})</span></button>
+												{/each}
+												{#if visible < list.length}
+													<button type="button" class="flex items-center justify-center gap-2 w-full px-2 py-1.5 text-xs rounded-md text-slate-500 hover:text-violet-500 hover:bg-slate-100 dark:hover:bg-slate-800/60 transition-colors bg-transparent border-none cursor-pointer" onclick={() => loadMoreContributorCommits(c.key)}><span>Load more ({list.length - visible})</span></button>
+												{/if}
 											{/if}
-										{/if}
-									</div>
-								{/if}
-							</div>
-						{/each}
-					</div>
+										</div>
+									{/if}
+								</div>
+							{/each}
+						</div>
+					{/if}
+				</div>
+				{#if branchInfo?.nested && branchInfo.nested.length > 0}
+					{#each branchInfo.nested as nested (nested.path)}
+						{@render nestedContributorBlock(nested)}
+					{/each}
 				{/if}
 			</div>
 			{/if}

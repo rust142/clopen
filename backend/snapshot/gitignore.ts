@@ -23,6 +23,138 @@ const ALWAYS_EXCLUDE_DIRS = new Set([
 ]);
 
 /**
+ * Find paths of all nested git repos (directories with their own `.git`) at any
+ * depth under `rootPath`. Walks into nested repos to find deeply nested ones.
+ * Does NOT scan the repos — just returns their absolute paths.
+ *
+ * Used by callers that need to run git commands inside each nested repo
+ * (e.g. `git:status` aggregating changes from nested repos into the Changes
+ * tab of the Git panel).
+ */
+export async function findNestedRepoPaths(rootPath: string): Promise<string[]> {
+	const paths: string[] = [];
+
+	const walk = async (currentPath: string): Promise<void> => {
+		let entries;
+		try {
+			entries = await fs.readdir(currentPath, { withFileTypes: true });
+		} catch {
+			return;
+		}
+
+		for (const entry of entries) {
+			if (!entry.isDirectory()) continue;
+			if (ALWAYS_EXCLUDE_DIRS.has(entry.name)) continue;
+
+			const fullPath = path.join(currentPath, entry.name);
+
+			// Check if this directory is itself a git repo
+			try {
+				await fs.access(path.join(fullPath, '.git'));
+				paths.push(fullPath);
+				// Fall through to also walk into it for deeper nested repos
+			} catch {
+				// Not a git repo
+			}
+
+			await walk(fullPath);
+		}
+	};
+
+	await walk(rootPath);
+	return paths;
+}
+
+/**
+ * Read the outer repo's `.gitmodules` file and return the set of relative
+ * submodule paths. Returns an empty set when the file is missing or unreadable
+ * (e.g. the project isn't a git repo at all, or has no submodules).
+ *
+ * The format is INI-like:
+ *   [submodule "vendor/foo"]
+ *           path = vendor/foo
+ *           url = git@example.com:vendor/foo.git
+ *
+ * The `path =` value is what we return — the directory inside the project root
+ * where the submodule is checked out. If a section omits `path =`, git falls
+ * back to the section name; we mirror that.
+ */
+export async function findSubmodulePaths(rootPath: string): Promise<Set<string>> {
+	const out = new Set<string>();
+	let raw: string;
+	try {
+		raw = await fs.readFile(path.join(rootPath, '.gitmodules'), 'utf8');
+	} catch {
+		return out; // file missing → no submodules
+	}
+
+	// Two-pass parse: collect per-section { name, path? } then resolve.
+	// Single-pass is simpler but needs careful handling of the implicit
+	// section-name fallback; the two-pass version reads more clearly.
+	const sections: Array<{ name: string; path?: string }> = [];
+	let current: { name: string; path?: string } | null = null;
+	for (const line of raw.split(/\r?\n/)) {
+		const trimmed = line.trim();
+		if (!trimmed || trimmed.startsWith('#')) continue;
+
+		const sectionMatch = trimmed.match(/^\[submodule\s+"([^"]+)"\]\s*$/);
+		if (sectionMatch) {
+			if (current) sections.push(current);
+			current = { name: sectionMatch[1] };
+			continue;
+		}
+		if (!current) continue;
+
+		const pathMatch = trimmed.match(/^path\s*=\s*(.+?)\s*$/);
+		if (pathMatch) current.path = pathMatch[1].replace(/\\/g, '/');
+	}
+	if (current) sections.push(current);
+
+	for (const s of sections) {
+		out.add(s.path ?? s.name);
+	}
+	return out;
+}
+
+/**
+ * Given a file path relative to the project root, find the deepest nested
+ * git repo that contains it. Returns the repo's absolute path and the file
+ * path relative to that repo, or `null` if the file lives in the outer repo.
+ *
+ * Used by git staging/discard handlers so that `git add` / `git restore` /
+ * `git rm` run inside the correct repo (the outer repo's `git` would skip
+ * or fail on files that are tracked by a nested repo).
+ */
+export async function findRepoForFile(
+	projectPath: string,
+	filePath: string
+): Promise<{ repoPath: string; relativeFilePath: string } | null> {
+	const normalizedFilePath = filePath.replace(/\\/g, '/');
+	const nestedRepoPaths = await findNestedRepoPaths(projectPath);
+
+	let bestMatch: { repoPath: string; relativeFilePath: string } | null = null;
+	let bestRepoRelLen = -1;
+
+	for (const repoPath of nestedRepoPaths) {
+		const repoRel = path.relative(projectPath, repoPath).replace(/\\/g, '/');
+		// File is inside this repo if its path starts with `repoRel/`
+		if (normalizedFilePath === repoRel || normalizedFilePath.startsWith(repoRel + '/')) {
+			if (repoRel.length > bestRepoRelLen) {
+				bestMatch = {
+					repoPath,
+					relativeFilePath: normalizedFilePath === repoRel
+						? ''
+						: normalizedFilePath.substring(repoRel.length + 1)
+				};
+				bestRepoRelLen = repoRel.length;
+			}
+		}
+	}
+
+	return bestMatch;
+}
+
+/**
  * Get list of snapshot-eligible files using git (preferred) or manual scan.
  * Returns full absolute paths.
  */
@@ -50,12 +182,38 @@ async function scanWithGit(dirPath: string): Promise<string[] | null> {
 	}
 
 	try {
+		// Scan the outer repo
+		const files = await scanSingleGitRepo(dirPath);
+
+		// Find and scan nested git repos — separate repositories living inside
+		// the project (e.g. a theme extracted into its own repo). The parent
+		// repo's `git ls-files --exclude-standard` skips these because git treats
+		// a nested repo as a single gitlink entry (or excludes it entirely when
+		// it's listed in the parent's .gitignore). Without this step, files
+		// inside nested repos are invisible to the snapshot system, so AI
+		// changes to them never appear in the checkpoint banner.
+		const nestedFiles = await findAndScanNestedRepos(dirPath);
+
+		const allFiles = [...files, ...nestedFiles];
+		debug.log('snapshot', `Git scan found ${allFiles.length} files (${files.length} outer, ${nestedFiles.length} nested)`);
+		return allFiles;
+	} catch (err) {
+		debug.warn('snapshot', 'git ls-files failed, falling back to manual scan:', err);
+		return null;
+	}
+}
+
+/**
+ * Run `git ls-files -co --exclude-standard` in a single git repo and return
+ * absolute paths. Used for both the outer repo and nested repos.
+ */
+async function scanSingleGitRepo(dirPath: string): Promise<string[]> {
+	try {
 		const result = await execGit(['ls-files', '-co', '--exclude-standard'], dirPath, 60_000);
-		if (result.exitCode !== 0) return null;
-		const output = result.stdout;
+		if (result.exitCode !== 0) return [];
 
 		const files: string[] = [];
-		for (const line of output.split('\n')) {
+		for (const line of result.stdout.split('\n')) {
 			const relativePath = line.trim();
 			if (!relativePath) continue;
 
@@ -63,15 +221,68 @@ async function scanWithGit(dirPath: string): Promise<string[] | null> {
 			const firstSegment = relativePath.split('/')[0];
 			if (ALWAYS_EXCLUDE_DIRS.has(firstSegment)) continue;
 
+			// Skip directory entries — git emits nested repos as a single
+			// entry with a trailing slash (e.g. `theme/`). These are handled
+			// by findAndScanNestedRepos, not here.
+			if (relativePath.endsWith('/')) continue;
+
 			files.push(path.join(dirPath, relativePath));
 		}
-
-		debug.log('snapshot', `Git scan found ${files.length} files`);
 		return files;
 	} catch (err) {
-		debug.warn('snapshot', 'git ls-files failed, falling back to manual scan:', err);
-		return null;
+		debug.warn('snapshot', `git ls-files failed for ${dirPath}:`, err);
+		return [];
 	}
+}
+
+/**
+ * Walk the project tree to find nested git repos (directories with their own
+ * `.git`) and scan each one independently. This catches nested repos that are
+ * gitignored by the parent — they'd otherwise be invisible to the outer repo's
+ * `git ls-files --exclude-standard`.
+ *
+ * The walk respects ALWAYS_EXCLUDE_DIRS (skips `.git`, `node_modules`) but does
+ * NOT respect .gitignore, because the nested repo we're looking for may itself
+ * be gitignored by the parent. Once a nested repo is found, its own
+ * `git ls-files --exclude-standard` handles its .gitignore rules.
+ */
+async function findAndScanNestedRepos(rootPath: string): Promise<string[]> {
+	const files: string[] = [];
+
+	const walk = async (currentPath: string): Promise<void> => {
+		let entries;
+		try {
+			entries = await fs.readdir(currentPath, { withFileTypes: true });
+		} catch {
+			return;
+		}
+
+		for (const entry of entries) {
+			if (!entry.isDirectory()) continue;
+			if (ALWAYS_EXCLUDE_DIRS.has(entry.name)) continue;
+
+			const fullPath = path.join(currentPath, entry.name);
+
+			// Check if this directory is itself a git repo (`.git` can be a
+			// directory or a file — the latter for worktrees/submodules).
+			try {
+				await fs.access(path.join(fullPath, '.git'));
+				// Nested repo found — scan it independently, then continue
+				// walking into it to find even deeper nested repos.
+				const nestedFiles = await scanSingleGitRepo(fullPath);
+				files.push(...nestedFiles);
+				await walk(fullPath);
+				continue;
+			} catch {
+				// Not a git repo — recurse to find deeper nested repos
+			}
+
+			await walk(fullPath);
+		}
+	};
+
+	await walk(rootPath);
+	return files;
 }
 
 // ============================================================================
@@ -282,6 +493,18 @@ async function scanWithGitignoreParsing(projectPath: string): Promise<string[]> 
 				if (ALWAYS_EXCLUDE_DIRS.has(entry.name)) continue;
 
 				if (entry.isDirectory()) {
+					// Check if this is a nested git repo — scan it independently
+					// and bypass the .gitignore filter so files inside a
+					// gitignored nested repo are still tracked.
+					try {
+						await fs.access(path.join(fullPath, '.git'));
+						const nestedFiles = await scanSingleGitRepo(fullPath);
+						files.push(...nestedFiles);
+						continue;
+					} catch {
+						// Not a git repo — apply gitignore filter and recurse
+					}
+
 					if (!filter.isIgnored(relativePath, true)) {
 						await scan(fullPath);
 					}
