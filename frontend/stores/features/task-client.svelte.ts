@@ -75,6 +75,8 @@ export interface TrelloList {
 
 export interface TrelloCard {
 	id: string;
+	idShort?: number;
+	shortLink?: string;
 	name: string;
 	desc: string;
 	closed: boolean;
@@ -158,13 +160,13 @@ async function trelloFetch<T>(
 function createTaskClientStore() {
 	// Persisted accounts
 	let accounts = $state<TrelloAccount[]>(loadAccounts());
-	let selectedAccountId = $state<string | null>(accounts[0]?.id ?? null);
+	let selectedAccountId = $state<string | null>(loadSelectedAccountId() ?? accounts[0]?.id ?? null);
 
 	// Per-account data
 	let boards = $state<TrelloBoard[]>([]);
 	let organizations = $state<TrelloOrganization[]>([]);
 	let starredBoardIds = $state<string[]>(selectedAccountId ? loadStarredBoardIdsForAccount(selectedAccountId) : []);
-	let selectedBoardId = $state<string | null>(null);
+	let selectedBoardId = $state<string | null>(loadSelectedBoardId());
 	let lists = $state<TrelloList[]>([]);
 	let cards = $state<TrelloCard[]>([]);
 
@@ -179,7 +181,7 @@ function createTaskClientStore() {
 	let boardMembers = $state<{ id: string; fullName: string; username?: string; avatarUrl: string | null }[]>([]);
 
 	// Active card details
-	let activeCardId = $state<string | null>(null);
+	let activeCardId = $state<string | null>(loadActiveCardId());
 	const activeCardChecklists = $derived(boardChecklists.filter((cl) => cl.idCard === activeCardId));
 	let activeCardActions = $state<TrelloAction[]>([]);
 	let activeCardAttachments = $state<{ id: string; name: string; url: string; date: string; mimeType: string; bytes?: number; previews: { url: string; width: number; height: number }[] }[]>([]);
@@ -236,6 +238,21 @@ function createTaskClientStore() {
 		saveRecentBoards(recentBoards);
 	}
 
+	function loadSelectedAccountId(): string | null {
+		if (typeof localStorage === 'undefined') return null;
+		return localStorage.getItem('clopen:task-client:selected-account-id');
+	}
+
+	function loadSelectedBoardId(): string | null {
+		if (typeof localStorage === 'undefined') return null;
+		return localStorage.getItem('clopen:task-client:selected-board-id');
+	}
+
+	function loadActiveCardId(): string | null {
+		if (typeof localStorage === 'undefined') return null;
+		return localStorage.getItem('clopen:task-client:active-card-id');
+	}
+
 	function loadAccounts(): TrelloAccount[] {
 		if (typeof localStorage === 'undefined') return [];
 		try {
@@ -287,6 +304,9 @@ function createTaskClientStore() {
 		}
 		saveAccounts(accounts);
 		selectedAccountId = account.id;
+		if (typeof localStorage !== 'undefined') {
+			localStorage.setItem('clopen:task-client:selected-account-id', account.id);
+		}
 		starredBoardIds = loadStarredBoardIdsForAccount(account.id);
 		return account;
 	}
@@ -307,9 +327,19 @@ function createTaskClientStore() {
 
 		if (selectedAccountId === id) {
 			selectedAccountId = accounts[0]?.id ?? null;
+			if (typeof localStorage !== 'undefined') {
+				if (selectedAccountId) {
+					localStorage.setItem('clopen:task-client:selected-account-id', selectedAccountId);
+				} else {
+					localStorage.removeItem('clopen:task-client:selected-account-id');
+				}
+				localStorage.removeItem('clopen:task-client:selected-board-id');
+				localStorage.removeItem('clopen:task-client:active-card-id');
+			}
 			starredBoardIds = selectedAccountId ? loadStarredBoardIdsForAccount(selectedAccountId) : [];
 			boards = [];
 			selectedBoardId = null;
+			activeCardId = null;
 			lists = [];
 			cards = [];
 		}
@@ -317,9 +347,15 @@ function createTaskClientStore() {
 
 	function selectAccount(id: string) {
 		selectedAccountId = id;
+		if (typeof localStorage !== 'undefined') {
+			localStorage.setItem('clopen:task-client:selected-account-id', id);
+			localStorage.removeItem('clopen:task-client:selected-board-id');
+			localStorage.removeItem('clopen:task-client:active-card-id');
+		}
 		starredBoardIds = loadStarredBoardIdsForAccount(id);
 		boards = [];
 		selectedBoardId = null;
+		activeCardId = null;
 		lists = [];
 		cards = [];
 		error = null;
@@ -354,8 +390,25 @@ function createTaskClientStore() {
 		}
 	}
 
-	async function selectBoard(boardId: string): Promise<void> {
+	async function selectBoard(boardId: string | null): Promise<void> {
 		selectedBoardId = boardId;
+		if (typeof localStorage !== 'undefined') {
+			if (boardId) {
+				localStorage.setItem('clopen:task-client:selected-board-id', boardId);
+			} else {
+				localStorage.removeItem('clopen:task-client:selected-board-id');
+				localStorage.removeItem('clopen:task-client:active-card-id');
+			}
+		}
+		if (!boardId) {
+			lists = [];
+			cards = [];
+			boardChecklists = [];
+			boardLabels = [];
+			boardMembers = [];
+			activeCardId = null;
+			return;
+		}
 		const account = accounts.find((a) => a.id === selectedAccountId);
 		if (!account) return;
 		loadingCards = true;
@@ -370,7 +423,7 @@ function createTaskClientStore() {
 				trelloFetch<TrelloCard[]>(
 					account.apiKey,
 					account.token,
-					`/boards/${boardId}/cards?filter=open&fields=id,name,desc,closed,idList,idBoard,due,dueComplete,dueReminder,start,url,labels,badges,pos&members=true&member_fields=id,fullName,username,avatarUrl`
+					`/boards/${boardId}/cards?filter=open&fields=id,idShort,shortLink,name,desc,closed,idList,idBoard,due,dueComplete,dueReminder,start,url,labels,badges,pos&members=true&member_fields=id,fullName,username,avatarUrl`
 				),
 				trelloFetch<TrelloChecklist[]>(
 					account.apiKey,
@@ -427,6 +480,10 @@ function createTaskClientStore() {
 
 	async function selectRecentBoard(boardId: string, accountId: string): Promise<void> {
 		selectedAccountId = accountId;
+		if (typeof localStorage !== 'undefined') {
+			localStorage.setItem('clopen:task-client:selected-account-id', accountId);
+			localStorage.setItem('clopen:task-client:selected-board-id', boardId);
+		}
 		starredBoardIds = loadStarredBoardIdsForAccount(accountId);
 		selectedBoardId = boardId;
 		const account = accounts.find((a) => a.id === accountId);
@@ -443,7 +500,7 @@ function createTaskClientStore() {
 				trelloFetch<TrelloCard[]>(
 					account.apiKey,
 					account.token,
-					`/boards/${boardId}/cards?filter=open&fields=id,name,desc,closed,idList,idBoard,due,dueComplete,dueReminder,start,url,labels,badges,pos&members=true&member_fields=id,fullName,username,avatarUrl`
+					`/boards/${boardId}/cards?filter=open&fields=id,idShort,shortLink,name,desc,closed,idList,idBoard,due,dueComplete,dueReminder,start,url,labels,badges,pos&members=true&member_fields=id,fullName,username,avatarUrl`
 				),
 				trelloFetch<TrelloBoard[]>(
 					account.apiKey,
@@ -731,6 +788,38 @@ function createTaskClientStore() {
 			debug.error('task-client', 'updateCardDescription failed, reverting:', e);
 			if (cardIdx !== -1) {
 				cards[cardIdx].desc = originalDesc;
+			}
+			error = e instanceof Error ? e.message : String(e);
+			throw e;
+		}
+	}
+
+	async function updateCardName(cardId: string, name: string): Promise<void> {
+		const account = accounts.find((a) => a.id === selectedAccountId);
+		if (!account) return;
+
+		const cardIdx = cards.findIndex((c) => c.id === cardId);
+		let originalName = '';
+		if (cardIdx !== -1) {
+			originalName = cards[cardIdx].name;
+			cards[cardIdx].name = name;
+		}
+
+		try {
+			await trelloFetch<any>(
+				account.apiKey,
+				account.token,
+				`/cards/${cardId}`,
+				{
+					method: 'PUT',
+					headers: { 'Content-Type': 'application/json' },
+					body: JSON.stringify({ name })
+				}
+			);
+		} catch (e) {
+			debug.error('task-client', 'updateCardName failed, reverting:', e);
+			if (cardIdx !== -1) {
+				cards[cardIdx].name = originalName;
 			}
 			error = e instanceof Error ? e.message : String(e);
 			throw e;
@@ -1547,6 +1636,23 @@ function createTaskClientStore() {
 		}
 	}
 
+	// Auto-load boards and cards if we have saved account/board IDs on start
+	if (typeof window !== 'undefined') {
+		setTimeout(() => {
+			if (selectedAccountId) {
+				loadBoards().then(() => {
+					if (selectedBoardId) {
+						selectBoard(selectedBoardId).catch((e) => {
+							debug.error('task-client', 'Auto-load cards failed:', e);
+						});
+					}
+				}).catch((e) => {
+					debug.error('task-client', 'Auto-load boards failed:', e);
+				});
+			}
+		}, 0);
+	}
+
 	return {
 		get accounts() { return accounts; },
 		get selectedAccountId() { return selectedAccountId; },
@@ -1564,6 +1670,16 @@ function createTaskClientStore() {
 		get error() { return error; },
 		set error(val: string | null) { error = val; },
 		get activeCardId() { return activeCardId; },
+		set activeCardId(val: string | null) {
+			activeCardId = val;
+			if (typeof localStorage !== 'undefined') {
+				if (val) {
+					localStorage.setItem('clopen:task-client:active-card-id', val);
+				} else {
+					localStorage.removeItem('clopen:task-client:active-card-id');
+				}
+			}
+		},
 		get activeCardChecklists() { return activeCardChecklists; },
 		get activeCardActions() { return activeCardActions; },
 		get activeCardAttachments() { return activeCardAttachments; },
@@ -1588,6 +1704,7 @@ function createTaskClientStore() {
 		archiveAllCards,
 		fetchCardDetails,
 		updateCardDescription,
+		updateCardName,
 		updateCheckItemState,
 		addCheckItem,
 		addComment,

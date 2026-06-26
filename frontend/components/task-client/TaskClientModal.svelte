@@ -1,9 +1,10 @@
 <script lang="ts">
 	import Modal from '$frontend/components/common/overlay/Modal.svelte';
 	import Icon from '$frontend/components/common/display/Icon.svelte';
-	import { taskClientStore, type TrelloBoard } from '$frontend/stores/features/task-client.svelte';
+	import { taskClientStore, type TrelloBoard, type TrelloCard } from '$frontend/stores/features/task-client.svelte';
 	import type { IconName } from '$shared/types/ui/icons';
 	import CardDetailModal from './CardDetailModal.svelte';
+	import { debug } from '$shared/utils/logger';
 
 
 	interface TaskProvider {
@@ -172,10 +173,6 @@
 	function backToAccounts() {
 		trelloView = 'accounts';
 	}
-
-	const boardBg = $derived(
-		taskClientStore.selectedBoard?.prefs?.backgroundColor ?? '#0052CC'
-	);
 
 	const groupedWorkspaces = $derived.by(() => {
 		const orgMap = new Map<string | null, { name: string; boards: typeof taskClientStore.boards }>();
@@ -412,6 +409,456 @@
 	let isDetailModalOpen = $state(false);
 	let expandedChecklists = $state<Record<string, boolean>>({});
 	let showCardChecklists = $state<Record<string, boolean>>({});
+	let initialSection = $state<'labels' | 'members' | 'dates' | null>(null);
+
+	// Inline editing state
+	let editingCardId = $state<string | null>(null);
+	let editingCardTitle = $state('');
+	let isCancelling = false;
+	let editingCardRect = $state<{ top: number; left: number; width: number; height: number } | null>(null);
+	let editingCardSide = $state<'left' | 'right'>('right');
+	let copiedLink = $state(false);
+
+	let activePopover = $state<'actions' | 'labels' | 'members' | 'dates' | null>(null);
+	let searchLabelQuery = $state('');
+	let searchMemberQuery = $state('');
+
+	// Labels popover sub-states
+	let labelsPopoverMode = $state<'list' | 'create' | 'edit'>('list');
+	let editingLabelId = $state<string | null>(null);
+	let labelFormName = $state('');
+	let labelFormColor = $state('green');
+	const labelColors = ['green', 'yellow', 'orange', 'red', 'purple', 'blue', 'sky', 'lime', 'pink', 'black'];
+
+	let hasStartDate = $state(false);
+	let hasDueDate = $state(false);
+	let startDateVal = $state('');
+	let dueDateVal = $state('');
+
+	// Dates popover sub-states (mirroring CardDetailModal)
+	let calendarYear = $state(new Date().getFullYear());
+	let calendarMonth = $state(new Date().getMonth());
+	let activeDateField = $state<'start' | 'due'>('due');
+	let recurringVal = $state('Never');
+	let dueReminderVal = $state(-1);
+
+	const initDates = (card: TrelloCard) => {
+		if (card.start) {
+			hasStartDate = true;
+			const d = new Date(card.start);
+			const tzoffset = d.getTimezoneOffset() * 60000;
+			startDateVal = (new Date(d.getTime() - tzoffset)).toISOString().slice(0, 16);
+		} else {
+			hasStartDate = false;
+			startDateVal = '';
+		}
+
+		if (card.due) {
+			hasDueDate = true;
+			const d = new Date(card.due);
+			const tzoffset = d.getTimezoneOffset() * 60000;
+			dueDateVal = (new Date(d.getTime() - tzoffset)).toISOString().slice(0, 16);
+		} else {
+			hasDueDate = false;
+			dueDateVal = '';
+		}
+
+		if (card.dueReminder !== undefined) {
+			dueReminderVal = card.dueReminder ?? -1;
+		} else {
+			dueReminderVal = -1;
+		}
+
+		const savedRecurring = localStorage.getItem(`clopen_trello_card_recurring_${card.id}`);
+		recurringVal = savedRecurring || 'Never';
+
+		const initialDate = card.due ? new Date(card.due) : (card.start ? new Date(card.start) : new Date());
+		calendarYear = initialDate.getFullYear();
+		calendarMonth = initialDate.getMonth();
+		activeDateField = card.due ? 'due' : (card.start ? 'start' : 'due');
+	};
+
+	const startInlineEdit = (card: TrelloCard, event: MouseEvent) => {
+		editingCardId = card.id;
+		editingCardTitle = card.name;
+		isCancelling = false;
+		copiedLink = false;
+		activePopover = 'actions';
+
+		const button = event.currentTarget as HTMLElement;
+		const cardEl = button.closest('[data-card-id]') as HTMLElement;
+		if (cardEl) {
+			const rect = cardEl.getBoundingClientRect();
+			editingCardRect = {
+				top: rect.top,
+				left: rect.left,
+				width: rect.width,
+				height: rect.height
+			};
+
+			const actionWidth = 256;
+			const gap = 8;
+			const spaceRight = window.innerWidth - rect.right;
+			editingCardSide = spaceRight < (actionWidth + gap) ? 'left' : 'right';
+		} else {
+			editingCardRect = null;
+			editingCardSide = 'right';
+		}
+	};
+
+	const cancelInlineEdit = () => {
+		isCancelling = true;
+		editingCardId = null;
+		editingCardTitle = '';
+		editingCardRect = null;
+		activePopover = null;
+	};
+
+	const saveInlineEdit = async (cardId: string) => {
+		if (isCancelling) {
+			isCancelling = false;
+			return;
+		}
+		if (editingCardId !== cardId) return;
+
+		const name = editingCardTitle.trim();
+		editingCardId = null;
+		editingCardTitle = '';
+		editingCardRect = null;
+		activePopover = null;
+
+		if (!name) return;
+
+		const card = taskClientStore.cards.find((c) => c.id === cardId);
+		if (card && name === card.name) {
+			return;
+		}
+
+		try {
+			await taskClientStore.updateCardName(cardId, name);
+		} catch (e) {
+			debug.error('task-client', 'Failed to save card title inline:', e);
+		}
+	};
+
+	const handleInlineEditKeyDown = (e: KeyboardEvent, cardId: string) => {
+		if (e.key === 'Enter' && !e.shiftKey) {
+			e.preventDefault();
+			saveInlineEdit(cardId);
+		} else if (e.key === 'Escape') {
+			e.preventDefault();
+			cancelInlineEdit();
+		}
+	};
+
+	const focusTextarea = (el: HTMLTextAreaElement) => {
+		el.focus();
+		el.select();
+	};
+
+	const handleWindowMouseDown = (e: MouseEvent) => {
+		if (!editingCardId) return;
+
+		const target = e.target as HTMLElement;
+		const clickedCard = target.closest(`[data-card-id="${editingCardId}"]`);
+		const clickedDropdown = target.closest('.quick-actions-dropdown');
+		const clickedFloatingCard = target.closest('.floating-card-edit-container');
+
+		if (!clickedCard && !clickedDropdown && !clickedFloatingCard) {
+			saveInlineEdit(editingCardId);
+		}
+	};
+
+	const startCreateLabel = () => {
+		labelsPopoverMode = 'create';
+		editingLabelId = null;
+		labelFormName = '';
+		labelFormColor = 'green';
+	};
+
+	const startEditLabel = (labelId: string, name: string, color: string) => {
+		labelsPopoverMode = 'edit';
+		editingLabelId = labelId;
+		labelFormName = name;
+		labelFormColor = color;
+	};
+
+	const handleSaveLabelInline = async () => {
+		if (!labelFormColor) return;
+		try {
+			if (labelsPopoverMode === 'create') {
+				await taskClientStore.createLabel(labelFormName, labelFormColor);
+			} else if (labelsPopoverMode === 'edit' && editingLabelId) {
+				await taskClientStore.updateLabel(editingLabelId, labelFormName, labelFormColor);
+			}
+			labelsPopoverMode = 'list';
+			editingLabelId = null;
+			labelFormName = '';
+		} catch (err) {
+			debug.error('task-client', 'Failed to save label inline:', err);
+		}
+	};
+
+	const handleDeleteLabelInline = async (labelId: string) => {
+		try {
+			await taskClientStore.deleteLabel(labelId);
+			labelsPopoverMode = 'list';
+			editingLabelId = null;
+			labelFormName = '';
+		} catch (err) {
+			debug.error('task-client', 'Failed to delete label inline:', err);
+		}
+	};
+
+	const handleToggleLabel = async (cardId: string, labelId: string) => {
+		const card = taskClientStore.cards.find(c => c.id === cardId);
+		if (!card) return;
+
+		const isAssigned = card.labels.some(l => l.id === labelId);
+		try {
+			if (isAssigned) {
+				await taskClientStore.removeLabelFromCard(cardId, labelId);
+			} else {
+				await taskClientStore.addLabelToCard(cardId, labelId);
+			}
+		} catch (e) {
+			debug.error('task-client', 'Failed to toggle label inline:', e);
+		}
+	};
+
+	const handleToggleMember = async (cardId: string, memberId: string) => {
+		const card = taskClientStore.cards.find(c => c.id === cardId);
+		if (!card) return;
+
+		const isAssigned = card.members.some(m => m.id === memberId);
+		try {
+			if (isAssigned) {
+				await taskClientStore.removeMemberFromCard(cardId, memberId);
+			} else {
+				await taskClientStore.addMemberToCard(cardId, memberId);
+			}
+		} catch (e) {
+			debug.error('task-client', 'Failed to toggle member inline:', e);
+		}
+	};
+
+	const monthNames = [
+		'January', 'February', 'March', 'April', 'May', 'June',
+		'July', 'August', 'September', 'October', 'November', 'December'
+	];
+
+	const prevMonth = () => {
+		if (calendarMonth === 0) {
+			calendarMonth = 11;
+			calendarYear -= 1;
+		} else {
+			calendarMonth -= 1;
+		}
+	};
+
+	const nextMonth = () => {
+		if (calendarMonth === 11) {
+			calendarMonth = 0;
+			calendarYear += 1;
+		} else {
+			calendarMonth += 1;
+		}
+	};
+
+	const prevYear = () => {
+		calendarYear -= 1;
+	};
+
+	const nextYear = () => {
+		calendarYear += 1;
+	};
+
+	const selectCalendarDay = (day: number, month: number, year: number) => {
+		const pad = (n: number) => String(n).padStart(2, '0');
+		const dateStr = `${year}-${pad(month + 1)}-${pad(day)}`;
+		
+		if (activeDateField === 'start') {
+			hasStartDate = true;
+			const existingTime = startDateVal ? startDateVal.split('T')[1] : '09:00';
+			startDateVal = `${dateStr}T${existingTime}`;
+		} else {
+			hasDueDate = true;
+			const existingTime = dueDateVal ? dueDateVal.split('T')[1] : '12:00';
+			dueDateVal = `${dateStr}T${existingTime}`;
+		}
+	};
+
+	const isCellSelected = (day: number, month: number, year: number) => {
+		const val = activeDateField === 'start' ? startDateVal : dueDateVal;
+		if (!val) return false;
+		const d = new Date(val);
+		return d.getDate() === day && d.getMonth() === month && d.getFullYear() === year;
+	};
+
+	const calendarDays = $derived.by(() => {
+		const firstDayIndex = new Date(calendarYear, calendarMonth, 1).getDay();
+		const totalDays = new Date(calendarYear, calendarMonth + 1, 0).getDate();
+		const prevMonthTotalDays = new Date(calendarYear, calendarMonth, 0).getDate();
+
+		const cells = [];
+
+		for (let i = firstDayIndex - 1; i >= 0; i--) {
+			const d = prevMonthTotalDays - i;
+			const m = calendarMonth === 0 ? 11 : calendarMonth - 1;
+			const y = calendarMonth === 0 ? calendarYear - 1 : calendarYear;
+			cells.push({ day: d, month: m, year: y, current: false });
+		}
+
+		for (let d = 1; d <= totalDays; d++) {
+			cells.push({ day: d, month: calendarMonth, year: calendarYear, current: true });
+		}
+
+		const remaining = 42 - cells.length;
+		for (let d = 1; d <= remaining; d++) {
+			const m = calendarMonth === 11 ? 0 : calendarMonth + 1;
+			const y = calendarMonth === 11 ? calendarYear + 1 : calendarYear;
+			cells.push({ day: d, month: m, year: y, current: false });
+		}
+
+		return cells;
+	});
+
+	const recurringDayNumber = $derived.by(() => {
+		const d = dueDateVal ? new Date(dueDateVal) : new Date();
+		const dateNum = d.getDate();
+		const suffix = (n: number) => {
+			if (n > 3 && n < 21) return 'th';
+			switch (n % 10) {
+				case 1:  return "st";
+				case 2:  return "nd";
+				case 3:  return "rd";
+				default: return "th";
+			}
+		};
+		return `${dateNum}${suffix(dateNum)}`;
+	});
+
+	const recurringDayOfWeekDesc = $derived.by(() => {
+		const d = dueDateVal ? new Date(dueDateVal) : new Date();
+		const daysOfWeek = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+		const dayName = daysOfWeek[d.getDay()];
+		
+		const dateNum = d.getDate();
+		const occurrence = Math.ceil(dateNum / 7);
+		
+		const temp = new Date(d.getTime());
+		temp.setDate(temp.getDate() + 7);
+		const isLast = temp.getMonth() !== d.getMonth();
+		
+		const ordinals = ['first', 'second', 'third', 'fourth', 'fifth'];
+		const occurrenceWord = ordinals[occurrence - 1] ?? 'first';
+		
+		if (isLast) {
+			return `Monthly on the last ${dayName}`;
+		}
+		return `Monthly on the ${occurrenceWord} ${dayName}`;
+	});
+
+	const recurringYearlyDesc = $derived.by(() => {
+		const d = dueDateVal ? new Date(dueDateVal) : new Date();
+		const monthName = monthNames[d.getMonth()];
+		const dateNum = d.getDate();
+		const suffix = (n: number) => {
+			if (n > 3 && n < 21) return 'th';
+			switch (n % 10) {
+				case 1:  return "st";
+				case 2:  return "nd";
+				case 3:  return "rd";
+				default: return "th";
+			}
+		};
+		return `Yearly on ${monthName} ${dateNum}${suffix(dateNum)}`;
+	});
+
+	const handleSaveDatesInline = async (cardId: string) => {
+		try {
+			const startStr = hasStartDate && startDateVal ? new Date(startDateVal).toISOString() : null;
+			const dueStr = hasDueDate && dueDateVal ? new Date(dueDateVal).toISOString() : null;
+			await taskClientStore.updateCardDates(cardId, startStr, dueStr, dueReminderVal);
+			localStorage.setItem(`clopen_trello_card_recurring_${cardId}`, recurringVal);
+			cancelInlineEdit();
+		} catch (e) {
+			debug.error('task-client', 'Failed to save dates inline:', e);
+		}
+	};
+
+	const handleRemoveDatesInline = async (cardId: string) => {
+		try {
+			await taskClientStore.updateCardDates(cardId, null, null, -1);
+			localStorage.removeItem(`clopen_trello_card_recurring_${cardId}`);
+			cancelInlineEdit();
+		} catch (e) {
+			debug.error('task-client', 'Failed to remove dates inline:', e);
+		}
+	};
+
+	const handleQuickEditAction = async (
+		action: 'open' | 'labels' | 'members' | 'dates' | 'move' | 'copy' | 'copy-link' | 'mirror' | 'archive',
+		cardId: string
+	) => {
+		const card = taskClientStore.cards.find(c => c.id === cardId);
+		if (!card) return;
+
+		if (action === 'copy-link') {
+			try {
+				await navigator.clipboard.writeText(card.url);
+				copiedLink = true;
+				setTimeout(() => { copiedLink = false; }, 1500);
+			} catch (e) {
+				debug.error('task-client', 'Failed to copy card link:', e);
+			}
+			return;
+		} else if (action === 'mirror') {
+			try {
+				await navigator.clipboard.writeText(`[${card.name}](${card.url})`);
+				copiedLink = true;
+				setTimeout(() => { copiedLink = false; }, 1500);
+			} catch (e) {
+				debug.error('task-client', 'Failed to mirror card:', e);
+			}
+			return;
+		}
+
+		if (action === 'labels') {
+			searchLabelQuery = '';
+			activePopover = 'labels';
+		} else if (action === 'members') {
+			searchMemberQuery = '';
+			activePopover = 'members';
+		} else if (action === 'dates') {
+			initDates(card);
+			activePopover = 'dates';
+		} else {
+			cancelInlineEdit();
+
+			if (action === 'open') {
+				activeDetailCardId = card.id;
+				initialSection = null;
+				isDetailModalOpen = true;
+			} else if (action === 'move') {
+				activeDetailCardId = card.id;
+				initialSection = null;
+				isDetailModalOpen = true;
+			} else if (action === 'copy') {
+				try {
+					await taskClientStore.createCard(card.idList, `${card.name} (Copy)`);
+				} catch (e) {
+					debug.error('task-client', 'Failed to copy card:', e);
+				}
+			} else if (action === 'archive') {
+				try {
+					await taskClientStore.archiveCard(card.id);
+				} catch (e) {
+					debug.error('task-client', 'Failed to archive card:', e);
+				}
+			}
+		}
+	};
 
 	function formatCardDates(start: string | null, due: string | null): string {
 		if (!due) return '';
@@ -442,7 +889,12 @@
 		return 'bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700/80 border-transparent text-slate-500 dark:text-slate-400';
 	}
 
-	function handleCardClick(e: MouseEvent, cardId: string) {
+	const handleCardClick = (e: MouseEvent, cardId: string) => {
+		if (editingCardId === cardId) {
+			e.preventDefault();
+			e.stopPropagation();
+			return;
+		}
 		console.log('handleCardClick triggered for cardId:', cardId, 'button:', e.button);
 		if (e.button === 0 && !e.metaKey && !e.ctrlKey && !e.shiftKey && !e.altKey) {
 			e.preventDefault();
@@ -450,16 +902,22 @@
 			isDetailModalOpen = true;
 			console.log('isDetailModalOpen set to true, activeDetailCardId:', cardId);
 		}
-	}
+	};
 
-	function handleWindowKeyDown(e: KeyboardEvent) {
-		if (e.key === 'Escape' && taskClientStore.error) {
-			taskClientStore.error = null;
+	const handleWindowKeyDown = (e: KeyboardEvent) => {
+		if (e.key === 'Escape') {
+			if (editingCardId) {
+				cancelInlineEdit();
+				e.preventDefault();
+				e.stopPropagation();
+			} else if (taskClientStore.error) {
+				taskClientStore.error = null;
+			}
 		}
-	}
+	};
 </script>
 
-<svelte:window onkeydown={handleWindowKeyDown} />
+<svelte:window onkeydown={handleWindowKeyDown} onmousedown={handleWindowMouseDown} />
 
 <Modal
 	bind:isOpen
@@ -1125,12 +1583,27 @@
 															target="_blank"
 															rel="noopener noreferrer"
 															onclick={(e) => handleCardClick(e, card.id)}
-															draggable="true"
+															draggable={editingCardId !== card.id}
 															ondragstart={(e) => handleDragStart(e, card.id)}
 															ondragend={handleDragEnd}
 															data-card-id={card.id}
-															class="block p-2.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 hover:border-slate-300 dark:hover:border-slate-600 hover:shadow-sm transition-all cursor-pointer active:cursor-grabbing group"
+															class="relative block p-2.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 hover:border-slate-300 dark:hover:border-slate-600 hover:shadow-sm transition-all cursor-pointer active:cursor-grabbing group {editingCardId === card.id ? 'opacity-0 pointer-events-none' : ''}"
 														>
+															<!-- Edit Button (Pencil Icon) -->
+															{#if editingCardId !== card.id}
+																<button
+																	type="button"
+																	onclick={(e) => {
+																		e.stopPropagation();
+																		e.preventDefault();
+																		startInlineEdit(card, e);
+																	}}
+																	class="absolute top-2 right-2 w-6 h-6 rounded bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-500 hover:text-slate-700 dark:text-slate-400 dark:hover:text-slate-200 flex items-center justify-center border border-slate-200/50 dark:border-slate-700/50 cursor-pointer shadow-xs z-10 opacity-0 group-hover:opacity-100 transition-opacity"
+																	title="Quick edit card"
+																>
+																	<Icon name="lucide:pencil" class="w-3.5 h-3.5" />
+																</button>
+															{/if}
 															<!-- Labels -->
 															{#if card.labels.length > 0}
 																<div class="flex flex-wrap gap-1 mb-2">
@@ -1165,7 +1638,7 @@
 															{/if}
 
 															<!-- Title -->
-															<div class="flex items-start mb-2 min-w-0">
+															<div class="flex items-start mb-2 min-w-0 pr-6 w-full">
 																<button
 																	type="button"
 																	class="flex items-center justify-center rounded-full border shrink-0 mt-0.5 transition-all duration-200 ease-in-out overflow-hidden
@@ -1430,11 +1903,638 @@
 		<CardDetailModal
 			cardId={activeDetailCardId}
 			isOpen={isDetailModalOpen}
+			initialSection={initialSection}
 			onClose={() => {
 				isDetailModalOpen = false;
 				activeDetailCardId = null;
+				initialSection = null;
 			}}
 		/>
+
+		{#if editingCardId && editingCardRect}
+			{@const card = taskClientStore.cards.find(c => c.id === editingCardId)}
+			<!-- Backdrop overlay -->
+			<button
+				type="button"
+				class="fixed inset-0 z-[300] bg-black/60 cursor-default border-none w-full h-full animate-in fade-in duration-150"
+				onclick={cancelInlineEdit}
+				aria-label="Close inline edit"
+			></button>
+
+			<!-- Floating Card Edit Container (Left side / over the card) -->
+			<div
+				class="fixed z-[310] flex flex-col pointer-events-auto floating-card-edit-container"
+				style="
+					top: {editingCardRect.top}px;
+					left: {editingCardRect.left}px;
+					width: {editingCardRect.width}px;
+				"
+			>
+				<div class="bg-white dark:bg-slate-800 p-2.5 rounded-lg border border-slate-200/80 dark:border-slate-700/80 shadow-2xl flex flex-col gap-1.5">
+					<!-- Re-render the labels above the title -->
+					{#if card && card.labels.length > 0}
+						<div class="flex flex-wrap gap-1 mb-1.5 select-none">
+							{#each card.labels as label}
+								{@const labelColorMap: Record<string, string> = {
+									'green': '#61bd4f', 'yellow': '#f2d600', 'orange': '#ff9f1a',
+									'red': '#eb5a46', 'purple': '#c377e0', 'blue': '#0079bf',
+									'sky': '#00c2e0', 'lime': '#51e898', 'pink': '#ff78cb', 'black': '#344563'
+								}}
+								{@const bg = labelColorMap[label.color] ?? label.color ?? '#6b7280'}
+								<span
+									style="background-color: {bg}"
+									class="inline-block w-10 h-2 rounded {taskClientStore.colorblindMode ? `colorblind-pattern-${label.color}` : ''}"
+									title={label.name || label.color}
+								></span>
+							{/each}
+						</div>
+					{/if}
+
+					<textarea
+						bind:value={editingCardTitle}
+						use:focusTextarea
+						class="w-full bg-transparent border-none outline-none text-[13px] font-medium leading-snug text-slate-800 dark:text-slate-200 resize-none p-0 focus:ring-0 focus:outline-none"
+						rows="3"
+						onkeydown={(e) => handleInlineEditKeyDown(e, editingCardId!)}
+					></textarea>
+				</div>
+
+				<button
+					type="button"
+					onclick={() => saveInlineEdit(editingCardId!)}
+					class="mt-2 px-4 py-2 bg-violet-600 hover:bg-violet-700 text-white text-xs font-semibold rounded-lg shadow-md transition-colors cursor-pointer border-none self-start"
+				>
+					Save
+				</button>
+			</div>
+
+			<!-- Quick edit actions panel -->
+			{#if activePopover}
+				{#if activePopover === 'actions'}
+					<!-- Stack of individual floaty buttons next to card -->
+					<div
+						class="fixed z-[310] flex flex-col gap-1.5 quick-actions-dropdown"
+						style="
+							top: {editingCardRect.top}px;
+							left: {editingCardSide === 'right' ? editingCardRect.left + editingCardRect.width + 8 : Math.max(8, editingCardRect.left - 150 - 8)}px;
+							width: 150px;
+						"
+					>
+						<button
+							type="button"
+							onclick={() => handleQuickEditAction('open', editingCardId!)}
+							class="flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs font-semibold text-slate-200 bg-slate-800 hover:bg-slate-700 rounded-md border-none cursor-pointer transition-all hover:translate-x-1 duration-150 shadow-md"
+						>
+							<Icon name="lucide:external-link" class="w-3.5 h-3.5 text-slate-400" />
+							<span>Open card</span>
+						</button>
+						<button
+							type="button"
+							onclick={() => handleQuickEditAction('labels', editingCardId!)}
+							class="flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs font-semibold text-slate-200 bg-slate-800 hover:bg-slate-700 rounded-md border-none cursor-pointer transition-all hover:translate-x-1 duration-150 shadow-md"
+						>
+							<Icon name="lucide:tag" class="w-3.5 h-3.5 text-slate-400" />
+							<span>Edit labels</span>
+						</button>
+						<button
+							type="button"
+							onclick={() => handleQuickEditAction('members', editingCardId!)}
+							class="flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs font-semibold text-slate-200 bg-slate-800 hover:bg-slate-700 rounded-md border-none cursor-pointer transition-all hover:translate-x-1 duration-150 shadow-md"
+						>
+							<Icon name="lucide:users" class="w-3.5 h-3.5 text-slate-400" />
+							<span>Change members</span>
+						</button>
+						<button
+							type="button"
+							onclick={() => handleQuickEditAction('dates', editingCardId!)}
+							class="flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs font-semibold text-slate-200 bg-slate-800 hover:bg-slate-700 rounded-md border-none cursor-pointer transition-all hover:translate-x-1 duration-150 shadow-md"
+						>
+							<Icon name="lucide:clock" class="w-3.5 h-3.5 text-slate-400" />
+							<span>Edit dates</span>
+						</button>
+						<button
+							type="button"
+							onclick={() => handleQuickEditAction('move', editingCardId!)}
+							class="flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs font-semibold text-slate-200 bg-slate-800 hover:bg-slate-700 rounded-md border-none cursor-pointer transition-all hover:translate-x-1 duration-150 shadow-md"
+						>
+							<Icon name="lucide:arrow-right" class="w-3.5 h-3.5 text-slate-400" />
+							<span>Move</span>
+						</button>
+						<button
+							type="button"
+							onclick={() => handleQuickEditAction('copy', editingCardId!)}
+							class="flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs font-semibold text-slate-200 bg-slate-800 hover:bg-slate-700 rounded-md border-none cursor-pointer transition-all hover:translate-x-1 duration-150 shadow-md"
+						>
+							<Icon name="lucide:copy" class="w-3.5 h-3.5 text-slate-400" />
+							<span>Copy card</span>
+						</button>
+						<button
+							type="button"
+							onclick={() => handleQuickEditAction('copy-link', editingCardId!)}
+							class="flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs font-semibold text-slate-200 bg-slate-800 hover:bg-slate-700 rounded-md border-none cursor-pointer transition-all hover:translate-x-1 duration-150 shadow-md"
+						>
+							<Icon name={copiedLink ? "lucide:check" : "lucide:link"} class="w-3.5 h-3.5 {copiedLink ? 'text-emerald-500' : 'text-slate-400'}" />
+							<span>{copiedLink ? 'Copied!' : 'Copy link'}</span>
+						</button>
+						<button
+							type="button"
+							onclick={() => handleQuickEditAction('mirror', editingCardId!)}
+							class="flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs font-semibold text-slate-200 bg-slate-800 hover:bg-slate-700 rounded-md border-none cursor-pointer transition-all hover:translate-x-1 duration-150 shadow-md"
+						>
+							<Icon name="lucide:copy-plus" class="w-3.5 h-3.5 text-slate-400" />
+							<span>Mirror</span>
+						</button>
+						<button
+							type="button"
+							onclick={() => handleQuickEditAction('archive', editingCardId!)}
+							class="flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs font-semibold text-red-400 bg-slate-800 hover:bg-red-950/30 rounded-md border-none cursor-pointer transition-all hover:translate-x-1 duration-150 shadow-md"
+						>
+							<Icon name="lucide:archive" class="w-3.5 h-3.5 text-red-400" />
+							<span>Archive</span>
+						</button>
+					</div>
+				{:else}
+					<!-- Sub-popover settings card (e.g. edit labels checklist/dates picker/members selector) -->
+					<div
+						class="fixed z-[310] flex flex-col gap-3 bg-slate-800 backdrop-blur-md p-3.5 rounded-xl border border-slate-700/80 shadow-2xl quick-actions-dropdown text-slate-200"
+						style="
+							top: {Math.max(16, Math.min(editingCardRect.top, window.innerHeight - (activePopover === 'dates' ? 490 : 380)))}px;
+							left: {editingCardSide === 'right' ? editingCardRect.left + editingCardRect.width + 8 : Math.max(8, editingCardRect.left - 256 - 8)}px;
+							width: 256px;
+						"
+					>
+						{#if activePopover === 'labels'}
+					{@const card = taskClientStore.cards.find(c => c.id === editingCardId)}
+					{@const filteredLabels = taskClientStore.boardLabels.filter(label => 
+						!searchLabelQuery.trim() || 
+						(label.name || label.color).toLowerCase().includes(searchLabelQuery.toLowerCase())
+					)}
+					<!-- Header -->
+					<div class="flex items-center justify-between border-b border-slate-800 pb-2 mb-1 shrink-0">
+						<div class="flex items-center gap-1">
+							<button
+								type="button"
+								onclick={() => { 
+									if (labelsPopoverMode === 'list') {
+										activePopover = 'actions';
+									} else {
+										labelsPopoverMode = 'list';
+									}
+								}}
+								class="text-slate-400 hover:text-slate-200 bg-transparent border-none cursor-pointer p-0.5 rounded hover:bg-slate-800 transition-colors flex items-center justify-center"
+								title="Back"
+							>
+								<Icon name="lucide:chevron-left" class="w-4 h-4" />
+							</button>
+							<span class="text-xs font-bold text-slate-200">
+								{#if labelsPopoverMode === 'list'}
+									Labels
+								{:else if labelsPopoverMode === 'create'}
+									Create label
+								{:else if labelsPopoverMode === 'edit'}
+									Change label
+								{/if}
+							</span>
+						</div>
+						<button
+							type="button"
+							onclick={cancelInlineEdit}
+							class="text-slate-400 hover:text-slate-200 bg-transparent border-none cursor-pointer p-0.5 rounded hover:bg-slate-800 transition-colors flex items-center justify-center"
+							aria-label="Close labels popover"
+						>
+							<Icon name="lucide:x" class="w-3.5 h-3.5" />
+						</button>
+					</div>
+
+					{#if labelsPopoverMode === 'list'}
+						<!-- Search box -->
+						<div class="relative shrink-0">
+							<input
+								type="text"
+								placeholder="Search labels..."
+								bind:value={searchLabelQuery}
+								class="w-full bg-slate-900 border border-slate-700 focus:border-slate-600 text-slate-200 rounded px-2.5 py-1.5 text-xs placeholder-slate-500 focus:outline-none focus:ring-0"
+							/>
+						</div>
+
+						<!-- Labels List -->
+						<div class="flex flex-col gap-1.5 max-h-56 overflow-y-auto pr-1">
+							{#if filteredLabels.length === 0}
+								<div class="text-slate-500 text-xs py-2 text-center">No labels found</div>
+							{:else}
+								{#each filteredLabels as label}
+									{@const isAssigned = card?.labels.some(l => l.id === label.id)}
+									{@const labelColorMap: Record<string, string> = {
+										'green': '#61bd4f', 'yellow': '#f2d600', 'orange': '#ff9f1a',
+										'red': '#eb5a46', 'purple': '#c377e0', 'blue': '#0079bf',
+										'sky': '#00c2e0', 'lime': '#51e898', 'pink': '#ff78cb', 'black': '#344563'
+									}}
+									{@const bg = labelColorMap[label.color] ?? label.color ?? '#6b7280'}
+									<div class="flex items-center gap-2 group/row w-full">
+										<!-- Toggle checkbox -->
+										<button
+											type="button"
+											onclick={() => handleToggleLabel(editingCardId!, label.id)}
+											class="flex items-center justify-center w-5 h-5 rounded border transition cursor-pointer shrink-0
+												{isAssigned 
+													? 'border-violet-500 bg-slate-900 text-violet-400' 
+													: 'border-slate-700 bg-slate-900 text-transparent hover:border-slate-500'}"
+										>
+											{#if isAssigned}
+												<Icon name="lucide:check" class="w-3.5 h-3.5 stroke-[3]" />
+											{/if}
+										</button>
+
+										<!-- Colored label bar -->
+										<button
+											type="button"
+											onclick={() => handleToggleLabel(editingCardId!, label.id)}
+											style="background-color: {bg};"
+											class="flex-1 flex items-center text-left px-3 h-8 rounded-lg text-white font-bold text-xs transition cursor-pointer min-w-0 select-none shadow-sm hover:brightness-110 active:brightness-95 {taskClientStore.colorblindMode ? `colorblind-pattern-${label.color}` : ''}"
+										>
+											<span class="truncate pr-1">{label.name || ''}</span>
+										</button>
+
+										<!-- Edit pencil button -->
+										<button
+											type="button"
+											onclick={() => startEditLabel(label.id, label.name, label.color)}
+											class="w-8 h-8 flex items-center justify-center text-slate-400 hover:text-slate-200 hover:bg-slate-800 rounded transition cursor-pointer shrink-0 border-none bg-transparent"
+											title="Edit label"
+										>
+											<Icon name="lucide:pencil" class="w-3.5 h-3.5" />
+										</button>
+									</div>
+								{/each}
+							{/if}
+						</div>
+
+						<!-- Action buttons -->
+						<div class="flex flex-col gap-2 pt-2 border-t border-slate-800 shrink-0">
+							<button
+								type="button"
+								onclick={startCreateLabel}
+								class="w-full py-1.5 bg-slate-900 hover:bg-slate-800 border border-slate-700 hover:border-slate-600 text-slate-300 font-semibold rounded text-xs transition cursor-pointer text-center"
+							>
+								Create a new label
+							</button>
+							<button
+								type="button"
+								onclick={() => taskClientStore.toggleColorblindMode()}
+								class="w-full py-1.5 bg-slate-900 hover:bg-slate-800 border border-slate-700 hover:border-slate-600 text-slate-300 font-semibold rounded text-xs transition cursor-pointer text-center"
+							>
+								{taskClientStore.colorblindMode ? 'Disable' : 'Enable'} colorblind friendly mode
+							</button>
+						</div>
+					{:else if labelsPopoverMode === 'create' || labelsPopoverMode === 'edit'}
+						<!-- Title / Name Input -->
+						<div class="flex flex-col gap-1.5 text-xs shrink-0">
+							<label for="inline-label-name-input" class="text-[10px] font-bold text-slate-500 uppercase tracking-wider">Title</label>
+							<input
+								id="inline-label-name-input"
+								type="text"
+								placeholder="Label title..."
+								bind:value={labelFormName}
+								class="w-full bg-slate-900 border border-slate-700 focus:border-slate-600 text-slate-200 rounded px-2.5 py-1.5 text-xs focus:outline-none focus:ring-0"
+							/>
+						</div>
+
+						<!-- Color Selector Grid -->
+						<div class="flex flex-col gap-1.5 text-xs shrink-0">
+							<span class="text-[10px] font-bold text-slate-500 uppercase tracking-wider">Select a color</span>
+							<div class="grid grid-cols-5 gap-2">
+								{#each labelColors as color}
+									{@const labelColorMap: Record<string, string> = {
+										'green': '#61bd4f', 'yellow': '#f2d600', 'orange': '#ff9f1a',
+										'red': '#eb5a46', 'purple': '#c377e0', 'blue': '#0079bf',
+										'sky': '#00c2e0', 'lime': '#51e898', 'pink': '#ff78cb', 'black': '#344563'
+									}}
+									{@const bg = labelColorMap[color] ?? color}
+									{@const isSelected = labelFormColor === color}
+									<button
+										type="button"
+										onclick={() => { labelFormColor = color; }}
+										style="background-color: {bg};"
+										class="w-10 h-8 rounded relative transition-transform cursor-pointer shadow-sm hover:scale-105 active:scale-95 flex items-center justify-center border-none
+											{isSelected ? 'ring-2 ring-violet-500 ring-offset-2 ring-offset-slate-950' : ''}
+											{taskClientStore.colorblindMode ? `colorblind-pattern-${color}` : ''}"
+										title={color}
+									>
+										{#if isSelected}
+											<Icon name="lucide:check" class="w-4 h-4 text-white drop-shadow" />
+										{/if}
+									</button>
+								{/each}
+							</div>
+						</div>
+
+						<!-- Form Actions -->
+						<div class="flex items-center gap-2 pt-2 border-t border-slate-800 shrink-0">
+							{#if labelsPopoverMode === 'create'}
+								<button
+									type="button"
+									onclick={handleSaveLabelInline}
+									class="flex-1 py-1.5 bg-violet-600 hover:bg-violet-700 text-white font-semibold rounded text-xs transition cursor-pointer border-none"
+								>
+									Create
+								</button>
+							{:else}
+								<button
+									type="button"
+									onclick={handleSaveLabelInline}
+									class="flex-1 py-1.5 bg-violet-600 hover:bg-violet-700 text-white font-semibold rounded text-xs transition cursor-pointer border-none"
+								>
+									Save
+								</button>
+								<button
+									type="button"
+									onclick={() => handleDeleteLabelInline(editingLabelId!)}
+									class="flex-1 py-1.5 bg-red-600 hover:bg-red-700 text-white font-semibold rounded text-xs transition cursor-pointer border-none"
+								>
+									Delete
+								</button>
+							{/if}
+						</div>
+					{/if}
+				{:else if activePopover === 'members'}
+					{@const card = taskClientStore.cards.find(c => c.id === editingCardId)}
+					{@const filteredMembers = taskClientStore.boardMembers.filter(m => 
+						!searchMemberQuery.trim() || 
+						m.fullName.toLowerCase().includes(searchMemberQuery.toLowerCase()) ||
+						m.username?.toLowerCase().includes(searchMemberQuery.toLowerCase())
+					)}
+					<!-- Header -->
+					<div class="flex items-center justify-between border-b border-slate-800 pb-2 mb-1 shrink-0">
+						<div class="flex items-center gap-1">
+							<button
+								type="button"
+								onclick={() => { activePopover = 'actions'; }}
+								class="text-slate-400 hover:text-slate-200 bg-transparent border-none cursor-pointer p-0.5 rounded hover:bg-slate-800 transition-colors flex items-center justify-center"
+								title="Back"
+							>
+								<Icon name="lucide:chevron-left" class="w-4 h-4" />
+							</button>
+							<span class="text-xs font-bold text-slate-200">Members</span>
+						</div>
+						<button
+							type="button"
+							onclick={cancelInlineEdit}
+							class="text-slate-400 hover:text-slate-200 bg-transparent border-none cursor-pointer p-0.5 rounded hover:bg-slate-800 transition-colors flex items-center justify-center"
+							aria-label="Close members popover"
+						>
+							<Icon name="lucide:x" class="w-3.5 h-3.5" />
+						</button>
+					</div>
+
+					<!-- Search box -->
+					<div class="relative shrink-0">
+						<input
+							type="text"
+							placeholder="Search members..."
+							bind:value={searchMemberQuery}
+							class="w-full px-3 py-2 rounded-lg bg-slate-900 border border-slate-700 text-slate-200 text-xs focus:outline-none focus:ring-2 focus:ring-violet-500 placeholder-slate-500"
+						/>
+					</div>
+
+					<!-- Members List -->
+					<div class="flex flex-col gap-1 max-h-60 overflow-y-auto pr-1">
+						{#if filteredMembers.length === 0}
+							<div class="text-slate-500 text-xs py-2 text-center">No members found</div>
+						{:else}
+							{#each filteredMembers as member}
+								{@const isAssigned = card?.members.some(m => m.id === member.id)}
+								<button
+									type="button"
+									onclick={() => handleToggleMember(editingCardId!, member.id)}
+									class="flex items-center gap-3 px-2 py-2 rounded-lg hover:bg-slate-800 transition cursor-pointer border-none bg-transparent w-full text-left {isAssigned ? 'bg-slate-800/50' : ''}"
+								>
+									<!-- Avatar -->
+									{#if member.avatarUrl}
+										<img
+											src="{member.avatarUrl}/30.png"
+											alt={member.fullName}
+											class="w-7 h-7 rounded-full object-cover border border-slate-700 shrink-0"
+										/>
+									{:else}
+										<div class="w-7 h-7 rounded-full bg-violet-600 flex items-center justify-center text-[11px] font-bold text-white border border-slate-700 shrink-0">
+											{member.fullName.charAt(0).toUpperCase()}
+										</div>
+									{/if}
+									<!-- Name -->
+									<span class="flex-1 text-xs text-slate-200 truncate">{member.fullName}</span>
+									<!-- Check if assigned -->
+									{#if isAssigned}
+										<div class="w-4 h-4 rounded-full bg-violet-600 flex items-center justify-center shrink-0">
+											<Icon name="lucide:check" class="w-2.5 h-2.5 text-white stroke-[3]" />
+										</div>
+									{/if}
+								</button>
+							{/each}
+						{/if}
+					</div>
+				{:else if activePopover === 'dates'}
+					<!-- Header -->
+					<div class="flex items-center justify-between border-b border-slate-800 pb-2 mb-1 shrink-0">
+						<div class="flex items-center gap-1">
+							<button
+								type="button"
+								onclick={() => { activePopover = 'actions'; }}
+								class="text-slate-400 hover:text-slate-200 bg-transparent border-none cursor-pointer p-0.5 rounded hover:bg-slate-800 transition-colors flex items-center justify-center"
+								title="Back"
+							>
+								<Icon name="lucide:chevron-left" class="w-4 h-4" />
+							</button>
+							<span class="text-xs font-bold text-slate-200">Dates</span>
+						</div>
+						<button
+							type="button"
+							onclick={cancelInlineEdit}
+							class="text-slate-400 hover:text-slate-200 bg-transparent border-none cursor-pointer p-0.5 rounded hover:bg-slate-800 transition-colors flex items-center justify-center"
+							aria-label="Close dates popover"
+						>
+							<Icon name="lucide:x" class="w-3.5 h-3.5" />
+						</button>
+					</div>
+
+					<!-- Calendar month/year navigation -->
+					<div class="flex items-center justify-between text-xs text-slate-200 font-semibold bg-slate-900/50 py-1 px-1.5 rounded border border-slate-800 shrink-0">
+						<div class="flex items-center gap-0.5">
+							<button
+								type="button"
+								onclick={prevYear}
+								class="p-1 hover:bg-slate-800 rounded text-slate-400 hover:text-slate-200 cursor-pointer border-none bg-transparent"
+								title="Previous year"
+							>
+								<Icon name="lucide:chevrons-left" class="w-3.5 h-3.5" />
+							</button>
+							<button
+								type="button"
+								onclick={prevMonth}
+								class="p-1 hover:bg-slate-800 rounded text-slate-400 hover:text-slate-200 cursor-pointer border-none bg-transparent"
+								title="Previous month"
+							>
+								<Icon name="lucide:chevron-left" class="w-3.5 h-3.5" />
+							</button>
+						</div>
+						
+						<span class="select-none">{monthNames[calendarMonth]} {calendarYear}</span>
+
+						<div class="flex items-center gap-0.5">
+							<button
+								type="button"
+								onclick={nextMonth}
+								class="p-1 hover:bg-slate-800 rounded text-slate-400 hover:text-slate-200 cursor-pointer border-none bg-transparent"
+								title="Next month"
+							>
+								<Icon name="lucide:chevron-right" class="w-3.5 h-3.5" />
+							</button>
+							<button
+								type="button"
+								onclick={nextYear}
+								class="p-1 hover:bg-slate-800 rounded text-slate-400 hover:text-slate-200 cursor-pointer border-none bg-transparent"
+								title="Next year"
+							>
+								<Icon name="lucide:chevrons-right" class="w-3.5 h-3.5" />
+							</button>
+						</div>
+					</div>
+
+					<!-- Weekday Headers -->
+					<div class="grid grid-cols-7 text-center text-[10px] font-bold text-slate-500 select-none shrink-0">
+						<span>Su</span>
+						<span>Mo</span>
+						<span>Tu</span>
+						<span>We</span>
+						<span>Th</span>
+						<span>Fr</span>
+						<span>Sa</span>
+					</div>
+
+					<!-- Day cells grid -->
+					<div class="grid grid-cols-7 gap-1 text-center text-xs shrink-0">
+						{#each calendarDays as cell}
+							{@const isSelected = isCellSelected(cell.day, cell.month, cell.year)}
+							<button
+								type="button"
+								onclick={() => selectCalendarDay(cell.day, cell.month, cell.year)}
+								class="aspect-square flex items-center justify-center rounded-full text-xs cursor-pointer border-none transition-colors
+									{cell.current ? 'text-slate-200' : 'text-slate-600'}
+									{isSelected 
+										? 'bg-violet-600 text-white font-bold' 
+										: cell.current 
+											? 'bg-transparent hover:bg-slate-800' 
+											: 'bg-transparent hover:bg-slate-900/50'}"
+							>
+								{cell.day}
+							</button>
+						{/each}
+					</div>
+
+					<!-- Scrollable options list -->
+					<div class="flex flex-col gap-3 overflow-y-auto pr-1 max-h-56">
+						<!-- Start date row -->
+						<div class="flex flex-col gap-1">
+							<span class="text-[10px] text-slate-400 font-semibold select-none">Start date</span>
+							<div class="flex items-center gap-2">
+								<input
+									type="checkbox"
+									bind:checked={hasStartDate}
+									class="w-4 h-4 accent-violet-600 rounded bg-slate-900 border border-slate-700 cursor-pointer shrink-0"
+								/>
+								<input
+									type="datetime-local"
+									bind:value={startDateVal}
+									disabled={!hasStartDate}
+									onfocus={() => activeDateField = 'start'}
+									class="flex-1 px-2.5 py-1.5 rounded bg-slate-900 text-slate-200 text-xs focus:outline-none focus:ring-1 focus:ring-violet-500 disabled:opacity-50 disabled:cursor-not-allowed transition-all
+										{activeDateField === 'start' ? 'border border-violet-500 ring-1 ring-violet-500' : 'border border-slate-700'}"
+								/>
+							</div>
+						</div>
+
+						<!-- Due date row -->
+						<div class="flex flex-col gap-1">
+							<span class="text-[10px] text-slate-400 font-semibold select-none">Due date</span>
+							<div class="flex items-center gap-2">
+								<input
+									type="checkbox"
+									bind:checked={hasDueDate}
+									class="w-4 h-4 accent-violet-600 rounded bg-slate-900 border border-slate-700 cursor-pointer shrink-0"
+								/>
+								<input
+									type="datetime-local"
+									bind:value={dueDateVal}
+									disabled={!hasDueDate}
+									onfocus={() => activeDateField = 'due'}
+									class="flex-1 px-2.5 py-1.5 rounded bg-slate-900 text-slate-200 text-xs focus:outline-none focus:ring-1 focus:ring-violet-500 disabled:opacity-50 disabled:cursor-not-allowed transition-all
+										{activeDateField === 'due' ? 'border border-violet-500 ring-1 ring-violet-500' : 'border border-slate-700'}"
+								/>
+							</div>
+						</div>
+
+						<!-- Recurring -->
+						<div class="flex flex-col gap-1">
+							<span class="text-[10px] text-slate-400 font-semibold select-none">Recurring</span>
+							<select
+								bind:value={recurringVal}
+								class="w-full px-2.5 py-1.5 rounded bg-slate-900 border border-slate-700 text-slate-200 text-xs focus:outline-none focus:ring-1 focus:ring-violet-500 cursor-pointer"
+							>
+								<option>Never</option>
+								<option>Daily</option>
+								<option>Monday to Friday</option>
+								<option>Weekly</option>
+								<option>Monthly on the {recurringDayNumber}</option>
+								<option>{recurringDayOfWeekDesc}</option>
+								<option>{recurringYearlyDesc}</option>
+							</select>
+						</div>
+
+						<!-- Set due date reminder -->
+						<div class="flex flex-col gap-1">
+							<span class="text-[10px] text-slate-400 font-semibold select-none">Set due date reminder</span>
+							<select
+								bind:value={dueReminderVal}
+								class="w-full px-2.5 py-1.5 rounded bg-slate-900 border border-slate-700 text-slate-200 text-xs focus:outline-none focus:ring-1 focus:ring-violet-500 cursor-pointer"
+							>
+								<option value={-1}>None</option>
+								<option value={0}>At time of due date</option>
+								<option value={5}>5 Minutes before</option>
+								<option value={10}>10 Minutes before</option>
+								<option value={15}>15 Minutes before</option>
+								<option value={60}>1 Hour before</option>
+								<option value={120}>2 Hours before</option>
+								<option value={1440}>1 Day before</option>
+								<option value={2880}>2 Days before</option>
+								<option value={10080}>1 Week before</option>
+								<option value={20160}>2 Weeks before</option>
+							</select>
+						</div>
+					</div>
+
+					<!-- Actions -->
+					<div class="flex gap-2 text-[10px] mt-1 shrink-0 pt-2 border-t border-slate-800">
+						<button
+							type="button"
+							onclick={() => handleSaveDatesInline(editingCardId!)}
+							class="flex-1 py-1.5 bg-violet-600 hover:bg-violet-700 text-white font-semibold rounded transition cursor-pointer border-none"
+						>
+							Save
+						</button>
+						<button
+							type="button"
+							onclick={() => handleRemoveDatesInline(editingCardId!)}
+							class="flex-1 py-1.5 bg-slate-800 hover:bg-slate-700 border border-slate-750 text-slate-300 font-semibold rounded transition cursor-pointer"
+						>
+							Remove
+						</button>
+					</div>
+				{/if}
+			</div>
+		{/if}
+	{/if}
+{/if}
+
+
 
 		{#if taskClientStore.error}
 

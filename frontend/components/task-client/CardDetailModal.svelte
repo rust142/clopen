@@ -11,9 +11,39 @@
 		cardId: string | null;
 		isOpen: boolean;
 		onClose: () => void;
+		initialSection?: 'labels' | 'members' | 'dates' | null;
 	}
 
-	let { cardId, isOpen, onClose }: Props = $props();
+	let { cardId, isOpen, onClose, initialSection = null }: Props = $props();
+
+	let datesBtnEl = $state<HTMLButtonElement | null>(null);
+	let datesBadgeBtnEl = $state<HTMLButtonElement | null>(null);
+
+	$effect(() => {
+		if (isOpen && cardId) {
+			if (initialSection === 'labels') {
+				showLabelsPopover = true;
+			} else if (initialSection === 'members') {
+				showMembersPopover = true;
+			} else if (initialSection === 'dates') {
+				setTimeout(() => {
+					const triggerEl = datesBadgeBtnEl || datesBtnEl;
+					if (triggerEl) {
+						datesPopoverSource = datesBadgeBtnEl ? 'badge' : 'button';
+						updatePopoverPosition(triggerEl, 520);
+					} else {
+						popoverLeft = window.innerWidth / 2 - 144;
+						popoverTop = window.innerHeight / 2 - 260;
+					}
+					showDatesPopover = true;
+				}, 50);
+			}
+		} else {
+			showLabelsPopover = false;
+			showMembersPopover = false;
+			showDatesPopover = false;
+		}
+	});
 
 	// Component States
 	let isEditingDesc = $state(false);
@@ -1330,6 +1360,7 @@
 						{#if !(card.start || card.due)}
 						<div>
 							<button
+								bind:this={datesBtnEl}
 								type="button"
 								onclick={(e) => {
 									if (showDatesPopover && datesPopoverSource === 'button') {
@@ -1880,6 +1911,7 @@
 								<div class="flex items-center">
 									<!-- Clickable date badge button to open popover -->
 									<button
+										bind:this={datesBadgeBtnEl}
 										type="button"
 										onclick={(e) => {
 											if (showDatesPopover && datesPopoverSource === 'badge') {
@@ -2861,7 +2893,7 @@
 			<button
 				type="button"
 				onclick={handleRemoveDates}
-				class="flex-1 py-1.5 bg-slate-800 hover:bg-slate-700 border border-slate-750 text-slate-300 font-semibold rounded transition cursor-pointer"
+				class="flex-1 py-1.5 bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-300 font-semibold rounded transition cursor-pointer"
 			>
 				Remove
 			</button>
