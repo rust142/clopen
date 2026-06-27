@@ -28,6 +28,7 @@ import { resolveOsPath } from '$backend/utils/paths';
 import { resolveBinary } from '$backend/utils/cli';
 import { getCleanSpawnEnv } from '$backend/utils/index.js';
 import { getCodexMcpConfig } from '../../../mcp';
+import { syncSkills } from '$backend/skills';
 import { CODEX_MODELS } from './models';
 import { debug } from '$shared/utils/logger';
 import { handleStreamError, buildTurnError } from './error-handler';
@@ -137,6 +138,9 @@ export class CodexEngine implements AIEngine {
 
 	async *streamQuery(options: EngineQueryOptions): AsyncGenerator<EngineOutput, void, unknown> {
 		const { projectPath, prompt, resume, modelId, abortController, accountId } = options;
+
+		// Refresh the synthetic skills preamble in CODEX_HOME before the turn.
+		await syncSkills('codex');
 
 		// Per-stream account override — same shape as Copilot. The SDK takes
 		// the apiKey at construction time, so an account switch requires
@@ -300,6 +304,18 @@ export class CodexEngine implements AIEngine {
 			throw new Error('Codex client unavailable.');
 		}
 
+		// Refresh auth.json for the active account before the turn (cheap
+		// idempotent op — keeps a freshly-refreshed on-disk token, see
+		// credential.ts). Without this the structured turn could run on a stale
+		// blob; without the finally-snapshot below, a refresh it performs would
+		// be lost and the next stream would replay a revoked token.
+		const structuredAccount = accountId != null
+			? engineQueries.getAccount(accountId)
+			: engineQueries.getActiveAccountForEngine('codex');
+		if (structuredAccount) {
+			applyAccountAuth(structuredAccount);
+		}
+
 		const controller = abortController || new AbortController();
 		const resolvedProjectPath = resolveOsPath(projectPath);
 
@@ -314,16 +330,26 @@ export class CodexEngine implements AIEngine {
 
 		debug.log('engine', `[codex structured] running with model=${modelId}`);
 
-		const turn = await thread.run(prompt, {
-			outputSchema: schema,
-			signal: controller.signal,
-		});
+		try {
+			const turn = await thread.run(prompt, {
+				outputSchema: schema,
+				signal: controller.signal,
+			});
 
-		if (!turn.finalResponse) {
-			throw new Error('Codex returned empty response');
+			if (!turn.finalResponse) {
+				throw new Error('Codex returned empty response');
+			}
+
+			return extractJson<T>(turn.finalResponse);
+		} finally {
+			// Persist any token refresh the CLI performed during this turn so the
+			// next stream doesn't replay an already-rotated (revoked) token.
+			try {
+				snapshotAuthJsonToActiveAccount();
+			} catch (snapshotErr) {
+				debug.warn('engine', 'Codex: post-structured auth.json snapshot failed (non-fatal):', snapshotErr);
+			}
 		}
-
-		return extractJson<T>(turn.finalResponse);
 	}
 }
 
