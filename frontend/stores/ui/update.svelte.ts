@@ -7,6 +7,13 @@ import ws from '$frontend/utils/ws';
 import { systemSettings } from '$frontend/stores/features/settings.svelte';
 import { debug } from '$shared/utils/logger';
 
+interface ReleaseNotes {
+	tag_name: string;
+	body: string;
+	html_url: string;
+	published_at: string;
+}
+
 interface UpdateState {
 	currentVersion: string;
 	latestVersion: string;
@@ -21,6 +28,8 @@ interface UpdateState {
 	pendingRestart: boolean;
 	pendingVersions: { from: string; to: string } | null;
 	showRestartModal: boolean;
+	releaseNotes: ReleaseNotes | null;
+	releaseNotesLoading: boolean;
 }
 
 export const updateState = $state<UpdateState>({
@@ -36,7 +45,9 @@ export const updateState = $state<UpdateState>({
 	updateSuccess: false,
 	pendingRestart: false,
 	pendingVersions: null,
-	showRestartModal: false
+	showRestartModal: false,
+	releaseNotes: null,
+	releaseNotesLoading: false
 });
 
 let checkInterval: ReturnType<typeof setInterval> | null = null;
@@ -104,6 +115,20 @@ export async function runUpdate(): Promise<void> {
 		debug.error('server', 'Update failed:', err);
 	} finally {
 		updateState.updating = false;
+	}
+}
+
+/** Fetch latest release notes from GitHub */
+export async function fetchReleaseNotes(): Promise<void> {
+	if (updateState.releaseNotesLoading) return;
+	updateState.releaseNotesLoading = true;
+	try {
+		const data = await ws.http('system:get-release-notes', {});
+		updateState.releaseNotes = data as ReleaseNotes;
+	} catch (err) {
+		debug.error('server', 'Failed to fetch release notes:', err);
+	} finally {
+		updateState.releaseNotesLoading = false;
 	}
 }
 
