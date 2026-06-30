@@ -102,6 +102,61 @@ export function applyAutoLimit(query: string, limit = 500): string {
 	return `${trimmed} LIMIT ${limit}`;
 }
 
+export function splitSqlQueries(sql: string): string[] {
+	const queries: string[] = [];
+	let current = '';
+	let inSingleQuote = false;
+	let inDoubleQuote = false;
+	let inComment = false;
+	let inBlockComment = false;
+	let i = 0;
+	while (i < sql.length) {
+		const char = sql[i];
+		const nextChar = sql[i + 1];
+
+		if (inComment) {
+			if (char === '\n') {
+				inComment = false;
+			}
+			current += char;
+		} else if (inBlockComment) {
+			if (char === '*' && nextChar === '/') {
+				inBlockComment = false;
+				current += '*/';
+				i++;
+			} else {
+				current += char;
+			}
+		} else if (char === '-' && nextChar === '-') {
+			inComment = true;
+			current += char;
+		} else if (char === '/' && nextChar === '*') {
+			inBlockComment = true;
+			current += '/*';
+			i++;
+		} else if (char === '\'' && !inDoubleQuote) {
+			inSingleQuote = !inSingleQuote;
+			current += char;
+		} else if (char === '"' && !inSingleQuote) {
+			inDoubleQuote = !inDoubleQuote;
+			current += char;
+		} else if (char === ';' && !inSingleQuote && !inDoubleQuote) {
+			if (current.trim()) {
+				queries.push(current.trim());
+			}
+			current = '';
+		} else {
+			current += char;
+		}
+		i++;
+	}
+	if (current.trim()) {
+		queries.push(current.trim());
+	}
+	return queries;
+}
+
+
 interface RunSafelyInput {
 	driver: DbDriver;
 	adapter: DbClientDriverAdapter;

@@ -17,10 +17,11 @@
 	const { connectionId, driver, database }: Props = $props();
 
 	const view = $derived(dbClientStore.getView(connectionId));
-	const queryText = $derived(view.query.text);
-	const result = $derived(view.query.result);
-	const errorMsg = $derived(view.query.error);
-	const running = $derived(view.query.running);
+	const activeTab = $derived(view.queryTabs.find((t) => t.id === view.activeQueryTabId) ?? view.queryTabs[0] ?? null);
+	const queryText = $derived(activeTab?.query.text ?? '');
+	const result = $derived(activeTab?.query.result ?? null);
+	const errorMsg = $derived(activeTab?.query.error ?? null);
+	const running = $derived(activeTab?.query.running ?? false);
 
 	let confirmOpen = $state(false);
 	let pendingClass = $state<QueryClass>('unknown');
@@ -183,12 +184,17 @@
 	</div>
 
 	<div bind:this={containerEl} class="flex-1 min-h-0 flex flex-col {isDragging ? 'select-none cursor-row-resize' : ''}">
-		<div class="min-h-[80px] overflow-hidden" style="flex: {editorRatio} 1 0;">
-			<MonacoCodeEditor
-				value={queryText}
-				{language}
-				{onChange}
-			/>
+		<div class="min-h-[80px] overflow-hidden flex flex-col" style="flex: {editorRatio} 1 0;">
+			{#if activeTab}
+				{#key activeTab.id}
+					<MonacoCodeEditor
+						value={queryText}
+						{language}
+						path={"db-client/queries/" + activeTab.id}
+						{onChange}
+					/>
+				{/key}
+			{/if}
 		</div>
 		<button
 			type="button"

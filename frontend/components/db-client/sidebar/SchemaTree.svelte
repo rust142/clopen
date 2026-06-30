@@ -107,12 +107,11 @@
 
 	function onObjectClick(node: DbClientSchemaNode, database?: string): void {
 		if (node.type === 'table' || node.type === 'collection' || node.type === 'view' || node.type === 'key') {
-			dbClientStore.setActiveObject(connectionId, {
+			dbClientStore.openTable(connectionId, {
 				name: node.name,
 				type: node.type,
 				database
 			});
-			dbClientStore.setView(connectionId, 'data');
 		}
 	}
 
@@ -165,6 +164,60 @@
 	}
 
 	const showingDatabases = $derived(useDatabaseTree && currentDb === null);
+
+	let searchQuery = $state('');
+	let isObjectSearchOpen = $state(false);
+
+	const filteredDatabases = $derived(
+		searchQuery.trim()
+			? databases.filter((db) => db.name.toLowerCase().includes(searchQuery.toLowerCase().trim()))
+			: databases
+	);
+
+	const filteredObjects = $derived(
+		searchQuery.trim()
+			? objects.filter((node) => node.name.toLowerCase().includes(searchQuery.toLowerCase().trim()))
+			: objects
+	);
+
+	$effect(() => {
+		void connectionId;
+		void currentDb;
+		searchQuery = '';
+	});
+	const view = $derived(dbClientStore.getView(connectionId));
+	const activeView = $derived(view?.activeView ?? null);
+
+	let querySearchQuery = $state('');
+	let isQuerySearchOpen = $state(false);
+	let isQueriesExpanded = $state(true);
+	let isObjectsExpanded = $state(true);
+	let isDatabasesExpanded = $state(true);
+
+	const filteredQueryTabs = $derived(
+		(view?.queryTabs ?? [])
+			.filter((tab) => {
+				const total = view?.queryTabs ?? [];
+				if (total.length <= 1 && tab.id === 'default') {
+					return false;
+				}
+				return true;
+			})
+			.filter((tab) => {
+				if (querySearchQuery.trim()) {
+					return tab.name.toLowerCase().includes(querySearchQuery.toLowerCase().trim());
+				}
+				return true;
+			})
+	);
+
+	let renameQueryId = $state<string | null>(null);
+	let renameQueryText = $state('');
+
+	function focusInput(node: HTMLInputElement): void {
+		node.focus();
+		node.select();
+	}
 </script>
 
 <div class="flex flex-col h-full min-h-0">
@@ -208,16 +261,6 @@
 					onclick={openCreateDb}
 					aria-label="New database"
 					title="New database"
-				>
-					<Icon name="lucide:plus" class="w-4 h-4" />
-				</button>
-			{:else if !showingDatabases && canCreateTable && onCreateTable}
-				<button
-					type="button"
-					class="flex items-center justify-center w-7 h-7 rounded-md text-slate-500 hover:bg-violet-500/10 hover:text-violet-600 transition-colors"
-					onclick={() => onCreateTable(currentDb ?? undefined)}
-					aria-label="New table"
-					title="New table"
 				>
 					<Icon name="lucide:plus" class="w-4 h-4" />
 				</button>
@@ -293,23 +336,272 @@
 		{#if error}
 			<div class="px-3 py-2 text-sm text-red-600 dark:text-red-400">{error}</div>
 		{:else if showingDatabases}
-			{#each databases as db (db.name)}
+			<div class="flex items-center justify-between px-2.5 py-1.5 text-2xs font-bold text-slate-400 dark:text-slate-500 uppercase tracking-wider select-none border-b border-slate-100 dark:border-slate-800/60 mb-1">
 				<button
 					type="button"
-					class="flex items-center gap-2 w-full px-2.5 py-1.5 rounded text-left text-sm hover:bg-slate-100 dark:hover:bg-slate-800/60 text-slate-700 dark:text-slate-300"
-					onclick={() => openDatabase(db.name)}
-					oncontextmenu={(e) => { e.preventDefault(); onContextMenu?.(e, db); }}
+					class="flex items-center gap-1 hover:text-slate-600 dark:hover:text-slate-350 cursor-pointer select-none font-bold uppercase tracking-wider text-2xs text-slate-400 dark:text-slate-500"
+					onclick={() => isDatabasesExpanded = !isDatabasesExpanded}
 				>
-					<Icon name="lucide:database" class="w-4 h-4 text-slate-400 shrink-0" />
-					<span class="truncate">{db.name}</span>
+					<Icon name={isDatabasesExpanded ? 'lucide:chevron-down' : 'lucide:chevron-right'} class="w-3 h-3 text-slate-400" />
+					<span>Databases</span>
 				</button>
-			{:else}
-				{#if !loading}
-					<div class="px-3 py-2 text-sm text-slate-400">No databases</div>
+				<button
+					type="button"
+					class="flex items-center justify-center w-5 h-5 rounded hover:bg-slate-200 dark:hover:bg-slate-800 text-slate-500 hover:text-slate-700 dark:hover:text-slate-300 transition-colors cursor-pointer"
+					onclick={() => {
+						isObjectSearchOpen = !isObjectSearchOpen;
+						if (!isObjectSearchOpen) searchQuery = '';
+					}}
+					title="Search databases"
+				>
+					<Icon name="lucide:search" class="w-3.5 h-3.5" />
+				</button>
+			</div>
+			{#if isDatabasesExpanded}
+				{#if isObjectSearchOpen}
+					<div class="px-2 py-1 mb-1.5 shrink-0">
+						<div class="flex items-center gap-2 px-2.5 py-1 bg-slate-100/80 dark:bg-slate-800/60 rounded-md">
+							<Icon name="lucide:search" class="w-3.5 h-3.5 text-slate-400 shrink-0" />
+							<input
+								type="text"
+								bind:value={searchQuery}
+								placeholder="Search databases..."
+								class="py-1 flex-1 bg-transparent border-none outline-none text-xs text-slate-900 dark:text-slate-100 placeholder:text-slate-400 min-w-0"
+								use:focusInput
+							/>
+							{#if searchQuery}
+								<button
+									type="button"
+									class="text-slate-400 hover:text-slate-600 dark:hover:text-slate-200 cursor-pointer shrink-0"
+									onclick={() => searchQuery = ''}
+									aria-label="Clear search"
+								>
+									<Icon name="lucide:x" class="w-3.5 h-3.5" />
+								</button>
+							{/if}
+						</div>
+					</div>
 				{/if}
-			{/each}
+				{#each filteredDatabases as db (db.name)}
+					<button
+						type="button"
+						class="flex items-center gap-2 w-full px-2.5 py-1.5 rounded text-left text-sm hover:bg-slate-100 dark:hover:bg-slate-800/60 text-slate-700 dark:text-slate-300"
+						onclick={() => openDatabase(db.name)}
+						oncontextmenu={(e) => { e.preventDefault(); onContextMenu?.(e, db); }}
+					>
+						<Icon name="lucide:database" class="w-4 h-4 text-slate-400 shrink-0" />
+						<span class="truncate">{db.name}</span>
+					</button>
+				{:else}
+					{#if !loading}
+						<div class="px-3 py-2 text-sm text-slate-400">No databases</div>
+					{/if}
+				{/each}
+			{/if}
 		{:else}
-			{#each objects as node (node.name)}
+			<!-- Saved Queries Section -->
+			<div class="mb-2">
+				<div class="flex items-center justify-between px-2.5 py-1.5 text-2xs font-bold text-slate-400 dark:text-slate-500 uppercase tracking-wider select-none border-b border-slate-100 dark:border-slate-800/60 mb-1">
+					<button
+						type="button"
+						class="flex items-center gap-1 hover:text-slate-600 dark:hover:text-slate-350 cursor-pointer select-none font-bold uppercase tracking-wider text-2xs text-slate-400 dark:text-slate-500"
+						onclick={() => isQueriesExpanded = !isQueriesExpanded}
+					>
+						<Icon name={isQueriesExpanded ? 'lucide:chevron-down' : 'lucide:chevron-right'} class="w-3 h-3 text-slate-400" />
+						<span>Saved Queries</span>
+					</button>
+					<div class="flex items-center gap-1">
+						<button
+							type="button"
+							class="flex items-center justify-center w-5 h-5 rounded hover:bg-slate-200 dark:hover:bg-slate-800 text-slate-500 hover:text-slate-700 dark:hover:text-slate-300 transition-colors cursor-pointer"
+							onclick={() => {
+								isQuerySearchOpen = !isQuerySearchOpen;
+								if (!isQuerySearchOpen) querySearchQuery = '';
+							}}
+							title="Search queries"
+						>
+							<Icon name="lucide:search" class="w-3.5 h-3.5" />
+						</button>
+						<button
+							type="button"
+							class="flex items-center justify-center w-5 h-5 rounded hover:bg-slate-200 dark:hover:bg-slate-800 text-slate-500 hover:text-slate-700 dark:hover:text-slate-300 transition-colors cursor-pointer"
+							onclick={() => {
+								const id = dbClientStore.openQueryTab(connectionId);
+								const activeView = dbClientStore.getView(connectionId);
+								const tab = activeView.queryTabs.find((t) => t.id === id);
+								if (tab) {
+									renameQueryId = id;
+									renameQueryText = tab.name;
+								}
+							}}
+							title="New SQL Query"
+						>
+							<Icon name="lucide:plus" class="w-3.5 h-3.5" />
+						</button>
+					</div>
+				</div>
+				{#if isQueriesExpanded}
+					{#if isQuerySearchOpen}
+						<div class="px-2 py-1 mb-1.5 shrink-0">
+						<div class="flex items-center gap-2 px-2.5 py-1 bg-slate-100/80 dark:bg-slate-800/60 rounded-md">
+							<Icon name="lucide:search" class="w-3.5 h-3.5 text-slate-400 shrink-0" />
+							<input
+								type="text"
+								bind:value={querySearchQuery}
+								placeholder="Search queries..."
+								class="py-1 flex-1 bg-transparent border-none outline-none text-xs text-slate-900 dark:text-slate-100 placeholder:text-slate-400 min-w-0"
+								use:focusInput
+							/>
+							{#if querySearchQuery}
+								<button
+									type="button"
+									class="text-slate-400 hover:text-slate-600 dark:hover:text-slate-200 cursor-pointer shrink-0"
+									onclick={() => querySearchQuery = ''}
+									aria-label="Clear search"
+								>
+									<Icon name="lucide:x" class="w-3.5 h-3.5" />
+								</button>
+							{/if}
+						</div>
+					</div>
+				{/if}
+				<div class="space-y-0.5">
+					{#each filteredQueryTabs as tab (tab.id)}
+						{@const isActive = activeView === 'query' && view?.activeQueryTabId === tab.id}
+						{#if renameQueryId === tab.id}
+							<div class="px-2 py-0.5">
+								<input
+									type="text"
+									class="w-full px-2 py-1 text-xs bg-white dark:bg-slate-900 border border-violet-500 rounded outline-none font-semibold text-slate-800 dark:text-slate-200"
+									bind:value={renameQueryText}
+									onkeydown={(e) => {
+										if (e.key === 'Enter') {
+											dbClientStore.renameQueryTab(connectionId, tab.id, renameQueryText);
+											renameQueryId = null;
+										} else if (e.key === 'Escape') {
+											renameQueryId = null;
+										}
+									}}
+									onblur={() => {
+										dbClientStore.renameQueryTab(connectionId, tab.id, renameQueryText);
+										renameQueryId = null;
+									}}
+									use:focusInput
+								/>
+							</div>
+						{:else}
+							<div class="flex items-center justify-between group rounded hover:bg-slate-100 dark:hover:bg-slate-800/60 {isActive ? 'bg-violet-500/10 text-violet-700 dark:text-violet-300 font-semibold' : 'text-slate-700 dark:text-slate-300'}"
+								oncontextmenu={(e) => {
+									e.preventDefault();
+									// Simple contextual prompt to rename or delete
+									renameQueryId = tab.id;
+									renameQueryText = tab.name;
+								}}
+							>
+								<button
+									type="button"
+									class="flex-1 flex items-center gap-2 px-2.5 py-1.5 text-left text-sm"
+									onclick={() => {
+										dbClientStore.setActiveQueryTab(connectionId, tab.id);
+									}}
+									ondblclick={() => {
+										renameQueryId = tab.id;
+										renameQueryText = tab.name;
+									}}
+									title="Double-click to rename"
+								>
+									<Icon name="lucide:code" class="w-4 h-4 text-slate-400 shrink-0" />
+									<span class="truncate">{tab.name}</span>
+								</button>
+								
+								<div class="flex items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity pr-1.5 animate-duration-150">
+									{#if tab.id !== 'default'}
+										<button
+											type="button"
+											class="p-1 rounded text-slate-400 hover:text-red-500 hover:bg-slate-200 dark:hover:bg-slate-700 transition-colors cursor-pointer"
+											onclick={(e) => {
+												e.stopPropagation();
+												dbClientStore.closeQueryTab(connectionId, tab.id);
+											}}
+											title="Delete query file"
+										>
+											<Icon name="lucide:trash-2" class="w-3.5 h-3.5" />
+										</button>
+									{/if}
+								</div>
+							</div>
+						{/if}
+					{:else}
+						<div class="px-2.5 py-1.5 text-xs text-slate-400 italic">No query file found</div>
+					{/each}
+				</div>
+				{/if}
+			</div>
+
+			<!-- Database Objects Section -->
+			<div class="flex items-center justify-between px-2.5 py-1.5 text-2xs font-bold text-slate-400 dark:text-slate-500 uppercase tracking-wider select-none border-b border-slate-100 dark:border-slate-800/60 mb-1">
+				<button
+					type="button"
+					class="flex items-center gap-1 hover:text-slate-600 dark:hover:text-slate-350 cursor-pointer select-none font-bold uppercase tracking-wider text-2xs text-slate-400 dark:text-slate-500"
+					onclick={() => isObjectsExpanded = !isObjectsExpanded}
+				>
+					<Icon name={isObjectsExpanded ? 'lucide:chevron-down' : 'lucide:chevron-right'} class="w-3 h-3 text-slate-400" />
+					<span>Schema Objects</span>
+				</button>
+				<div class="flex items-center gap-1">
+					<button
+						type="button"
+						class="flex items-center justify-center w-5 h-5 rounded hover:bg-slate-200 dark:hover:bg-slate-800 text-slate-500 hover:text-slate-700 dark:hover:text-slate-300 transition-colors cursor-pointer"
+						onclick={() => {
+							isObjectSearchOpen = !isObjectSearchOpen;
+							if (!isObjectSearchOpen) searchQuery = '';
+						}}
+						title="Search objects"
+					>
+						<Icon name="lucide:search" class="w-3.5 h-3.5" />
+					</button>
+					{#if !showingDatabases && canCreateTable && onCreateTable}
+						<button
+							type="button"
+							class="flex items-center justify-center w-5 h-5 rounded hover:bg-slate-200 dark:hover:bg-slate-800 text-slate-500 hover:text-slate-700 dark:hover:text-slate-300 transition-colors cursor-pointer"
+							onclick={() => onCreateTable(currentDb ?? undefined)}
+							aria-label="New table"
+							title="New table"
+						>
+							<Icon name="lucide:plus" class="w-3.5 h-3.5" />
+						</button>
+					{/if}
+				</div>
+			</div>
+
+			{#if isObjectsExpanded}
+
+			{#if isObjectSearchOpen}
+				<div class="px-2 py-1 mb-1.5 shrink-0">
+					<div class="flex items-center gap-2 px-2.5 py-1 bg-slate-100/80 dark:bg-slate-800/60 rounded-md">
+						<Icon name="lucide:search" class="w-3.5 h-3.5 text-slate-400 shrink-0" />
+						<input
+							type="text"
+							bind:value={searchQuery}
+							placeholder="Search objects..."
+							class="py-1 flex-1 bg-transparent border-none outline-none text-xs text-slate-900 dark:text-slate-100 placeholder:text-slate-400 min-w-0"
+							use:focusInput
+						/>
+						{#if searchQuery}
+							<button
+								type="button"
+								class="text-slate-400 hover:text-slate-600 dark:hover:text-slate-200 cursor-pointer shrink-0"
+								onclick={() => searchQuery = ''}
+								aria-label="Clear search"
+							>
+								<Icon name="lucide:x" class="w-3.5 h-3.5" />
+							</button>
+						{/if}
+					</div>
+				</div>
+			{/if}
+
+			{#each filteredObjects as node (node.name)}
 				<button
 					type="button"
 					class="flex items-center gap-2 w-full px-2.5 py-1.5 rounded text-left text-sm {isActiveNode(node.name, currentDb ?? undefined)
@@ -326,6 +618,7 @@
 					<div class="px-3 py-2 text-sm text-slate-400">No objects</div>
 				{/if}
 			{/each}
+			{/if}
 		{/if}
 	</div>
 </div>

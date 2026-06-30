@@ -1,6 +1,7 @@
 import loader from '@monaco-editor/loader';
 import type * as Monaco from 'monaco-editor';
 import type { editor as MonacoEditor, Uri } from 'monaco-editor';
+import { dbClientStore } from '$frontend/stores/features/db-client.svelte';
 
 let monacoPromise: Promise<typeof Monaco> | null = null;
 let modelCounter = 0;
@@ -10,6 +11,7 @@ export function initMonaco(): Promise<typeof Monaco> {
 		monacoPromise = loader.init().then((monaco) => {
 			configureCompilerOptions(monaco);
 			configureDiagnostics(monaco);
+			registerSqlAutocomplete(monaco);
 			return monaco;
 		});
 	}
@@ -173,4 +175,86 @@ function configureDiagnostics(monaco: typeof Monaco) {
 	monaco.languages.css.cssDefaults.setOptions({ validate: false });
 	monaco.languages.css.scssDefaults.setOptions({ validate: false });
 	monaco.languages.css.lessDefaults.setOptions({ validate: false });
+}
+
+let sqlProviderDisposable: Monaco.IDisposable | null = null;
+
+function registerSqlAutocomplete(monaco: typeof Monaco) {
+	if (sqlProviderDisposable) {
+		sqlProviderDisposable.dispose();
+	}
+
+	sqlProviderDisposable = monaco.languages.registerCompletionItemProvider('sql', {
+		triggerCharacters: ['.', ' '],
+		provideCompletionItems: (model, position) => {
+			const word = model.getWordUntilPosition(position);
+			const range = {
+				startLineNumber: position.lineNumber,
+				endLineNumber: position.lineNumber,
+				startColumn: word.startColumn,
+				endColumn: word.endColumn
+			};
+
+			const suggestions: Monaco.languages.CompletionItem[] = [];
+
+			// 1. SQL Keywords
+			const SQL_KEYWORDS = [
+				'SELECT', 'FROM', 'WHERE', 'AND', 'OR', 'NOT', 'LIMIT', 'OFFSET',
+				'ORDER BY', 'GROUP BY', 'HAVING', 'JOIN', 'LEFT JOIN', 'RIGHT JOIN',
+				'INNER JOIN', 'ON', 'AS', 'INSERT INTO', 'VALUES', 'UPDATE', 'SET',
+				'DELETE FROM', 'CREATE TABLE', 'DROP TABLE', 'ALTER TABLE',
+				'IN', 'IS NULL', 'IS NOT NULL', 'LIKE', 'ILIKE', 'EXISTS'
+			];
+
+			for (const kw of SQL_KEYWORDS) {
+				suggestions.push({
+					label: kw,
+					kind: monaco.languages.CompletionItemKind.Keyword,
+					insertText: kw,
+					range
+				} as Monaco.languages.CompletionItem);
+			}
+
+			// 2. Tables and Views from current connection schema
+			const connId = dbClientStore.activeConnectionId;
+			if (connId) {
+				const schemaNodes = dbClientStore.schema[connId] ?? [];
+				for (const node of schemaNodes) {
+					if (node.type === 'table' || node.type === 'view') {
+						suggestions.push({
+							label: node.name,
+							kind: node.type === 'view'
+								? monaco.languages.CompletionItemKind.Interface
+								: monaco.languages.CompletionItemKind.Class,
+							insertText: node.name,
+							detail: node.type.toUpperCase(),
+							range
+						} as Monaco.languages.CompletionItem);
+					}
+				}
+
+				// 3. Columns from cached object details belonging to this connection
+				const details = dbClientStore.objectDetails;
+				const columnsSeen = new Set<string>();
+				for (const [key, value] of Object.entries(details)) {
+					if (key.startsWith(`${connId}::`) && value?.columns) {
+						for (const col of value.columns) {
+							if (!columnsSeen.has(col.name)) {
+								columnsSeen.add(col.name);
+								suggestions.push({
+									label: col.name,
+									kind: monaco.languages.CompletionItemKind.Field,
+									insertText: col.name,
+									detail: `COLUMN (${col.type})`,
+									range
+								} as Monaco.languages.CompletionItem);
+							}
+						}
+					}
+				}
+			}
+
+			return { suggestions };
+		}
+	});
 }

@@ -5,7 +5,7 @@
 import { t } from 'elysia';
 import { createRouter } from '$shared/utils/ws-server';
 import { connectionManager } from '../../db-client/connection-manager';
-import { runSafely } from '../../db-client/query-executor';
+import { runSafely, splitSqlQueries } from '../../db-client/query-executor';
 import { dbClientQueryHistoryQueries } from '../../database/queries';
 import { getDbClientPrincipal, requireDbClientConnectionAccess } from './access';
 import { debug } from '$shared/utils/logger';
@@ -55,6 +55,41 @@ export const queryHandler = createRouter()
 		const connection = requireDbClientConnectionAccess(conn, data.connectionId);
 		const adapter = await connectionManager.get(data.connectionId);
 		try {
+			const isSql = connection.driver === 'mysql' || connection.driver === 'postgres' || connection.driver === 'sqlite';
+			if (isSql) {
+				const queries = splitSqlQueries(data.query);
+				if (queries.length > 1) {
+					const results: any[] = [];
+					let totalDuration = 0;
+					for (const q of queries) {
+						const res = await runSafely({
+							driver: connection.driver,
+							adapter,
+							query: q,
+							params: data.params,
+							mode: 'read',
+							database: data.database,
+							limit: data.limit
+						});
+						results.push(res);
+						totalDuration += res.durationMs;
+					}
+					const combined = { ...results[0] };
+					combined.results = results;
+					combined.durationMs = totalDuration;
+					recordHistory({
+						connectionId: data.connectionId,
+						userId,
+						query: data.query,
+						status: 'success',
+						durationMs: totalDuration,
+						rowCount: results.reduce((acc, r) => acc + (r.rowCount ?? 0), 0),
+						error: null
+					});
+					return combined;
+				}
+			}
+
 			const result = await runSafely({
 				driver: connection.driver,
 				adapter,

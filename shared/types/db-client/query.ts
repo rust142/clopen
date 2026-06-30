@@ -9,6 +9,7 @@ export interface DbClientQueryResult {
 	affectedRows: number | null;
 	durationMs: number;
 	driverMeta: Record<string, unknown>;
+	results?: DbClientQueryResult[];
 }
 
 export type DbClientSchemaNodeType =
