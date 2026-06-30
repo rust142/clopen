@@ -63,6 +63,7 @@
 		fontSize: 12,
 		lineHeight: 18,
 		lineNumbers: 'on',
+		glyphMargin: true,
 		minimap: { enabled: false },
 		scrollBeyondLastLine: false,
 		wordWrap: 'on',
