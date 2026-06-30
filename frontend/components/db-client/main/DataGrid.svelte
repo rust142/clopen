@@ -521,6 +521,206 @@
 		if (sortColumn !== col) return 'lucide:chevrons-up-down';
 		return sortDir === 'asc' ? 'lucide:chevron-up' : 'lucide:chevron-down';
 	}
+
+	let showActionMenu = $state(false);
+
+	const getSelectedRowsData = (): { columns: string[]; rows: unknown[][] } => {
+		const currentResult = result;
+		if (!currentResult) return { columns: [], rows: [] };
+		const columns = currentResult.columns.map((c) => c.name);
+		const rows = Array.from(selected).map((idx) => {
+			const row = currentResult.rows[idx];
+			return columns.map((colName) => row[colName]);
+		});
+		return { columns, rows };
+	};
+
+	const copySelectedAll = (): void => {
+		const currentResult = result;
+		if (!currentResult) return;
+		const selectedRows = Array.from(selected).map((idx) => currentResult.rows[idx]);
+		void navigator.clipboard.writeText(JSON.stringify(selectedRows, null, 2));
+		showActionMenu = false;
+	};
+
+	const copySelectedCsv = (): void => {
+		const { columns, rows } = getSelectedRowsData();
+		const csvContent = generateCsvContent(columns, rows);
+		void navigator.clipboard.writeText(csvContent);
+		showActionMenu = false;
+	};
+
+	const copySelectedXlsx = (): void => {
+		const { columns, rows } = getSelectedRowsData();
+		const tsvContent = generateTsvContent(columns, rows);
+		void navigator.clipboard.writeText(tsvContent);
+		showActionMenu = false;
+	};
+
+	const exportSelectedXlsx = async (): Promise<void> => {
+		const { columns, rows } = getSelectedRowsData();
+		const { zipSync } = await import('fflate');
+		const xlsxData = generateXlsxData(columns, rows, zipSync);
+		const blob = new Blob([xlsxData as any], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+		const url = URL.createObjectURL(blob);
+		const a = document.createElement('a');
+		a.href = url;
+		a.download = `${objectName}_selected.xlsx`;
+		document.body.appendChild(a);
+		a.click();
+		document.body.removeChild(a);
+		URL.revokeObjectURL(url);
+		showActionMenu = false;
+	};
+
+	const exportSelectedCsv = (): void => {
+		const { columns, rows } = getSelectedRowsData();
+		const csvContent = generateCsvContent(columns, rows);
+		const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+		const url = URL.createObjectURL(blob);
+		const a = document.createElement('a');
+		a.href = url;
+		a.download = `${objectName}_selected.csv`;
+		document.body.appendChild(a);
+		a.click();
+		document.body.removeChild(a);
+		URL.revokeObjectURL(url);
+		showActionMenu = false;
+	};
+
+	const generateCsvContent = (columns: string[], rows: unknown[][]): string => {
+		const headers = columns.map(escapeCsvValue).join(',');
+		const body = rows
+			.map((row) => row.map(escapeCsvValue).join(','))
+			.join('\n');
+		return headers + '\n' + body;
+	};
+
+	const generateTsvContent = (columns: string[], rows: unknown[][]): string => {
+		const headers = columns.map(escapeTsvValue).join('\t');
+		const body = rows
+			.map((row) => row.map(escapeTsvValue).join('\t'))
+			.join('\n');
+		return headers + '\n' + body;
+	};
+
+	const escapeCsvValue = (val: unknown): string => {
+		if (val === null || val === undefined) return '';
+		const str = typeof val === 'object' ? JSON.stringify(val) : String(val);
+		if (str.includes(',') || str.includes('"') || str.includes('\n') || str.includes('\r')) {
+			return '"' + str.replace(/"/g, '""') + '"';
+		}
+		return str;
+	};
+
+	const escapeTsvValue = (val: unknown): string => {
+		if (val === null || val === undefined) return '';
+		const str = typeof val === 'object' ? JSON.stringify(val) : String(val);
+		if (str.includes('\t') || str.includes('"') || str.includes('\n') || str.includes('\r')) {
+			return '"' + str.replace(/"/g, '""') + '"';
+		}
+		return str;
+	};
+
+	const escapeXmlValue = (unsafe: string): string => {
+		return unsafe.replace(/[<>&'"]/g, (c) => {
+			switch (c) {
+				case '<': return '&lt;';
+				case '>': return '&gt;';
+				case '&': return '&amp;';
+				case '\'': return '&apos;';
+				case '"': return '&quot;';
+				default: return c;
+			}
+		});
+	};
+
+	const getExcelCellRef = (colIdx: number, rowNum: number): string => {
+		let temp = colIdx;
+		let letter = '';
+		while (temp >= 0) {
+			letter = String.fromCharCode((temp % 26) + 65) + letter;
+			temp = Math.floor(temp / 26) - 1;
+		}
+		return letter + rowNum;
+	};
+
+	const generateXlsxData = (columns: string[], rows: unknown[][], zipSyncFn: any): Uint8Array => {
+		let sheetData = '';
+		
+		// Header row
+		sheetData += '<row r="1">';
+		for (let cIdx = 0; cIdx < columns.length; cIdx++) {
+			const cellRef = getExcelCellRef(cIdx, 1);
+			const val = escapeXmlValue(columns[cIdx]);
+			sheetData += `<c r="${cellRef}" t="inlineStr"><is><t>${val}</t></is></c>`;
+		}
+		sheetData += '</row>';
+
+		// Data rows
+		for (let rIdx = 0; rIdx < rows.length; rIdx++) {
+			const rowNum = rIdx + 2;
+			sheetData += `<row r="${rowNum}">`;
+			const row = rows[rIdx];
+			for (let cIdx = 0; cIdx < columns.length; cIdx++) {
+				const cellRef = getExcelCellRef(cIdx, rowNum);
+				const val = row[cIdx];
+				if (val === null || val === undefined) {
+					continue;
+				}
+				const isNum = typeof val === 'number';
+				const strVal = isNum ? String(val) : escapeXmlValue(typeof val === 'object' ? JSON.stringify(val) : String(val));
+				
+				if (isNum) {
+					sheetData += `<c r="${cellRef}"><v>${strVal}</v></c>`;
+				} else {
+					sheetData += `<c r="${cellRef}" t="inlineStr"><is><t>${strVal}</t></is></c>`;
+				}
+			}
+			sheetData += '</row>';
+		}
+
+		const sheet1Xml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+<sheetData>${sheetData}</sheetData>
+</worksheet>`;
+
+		const workbookXml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+<sheets>
+<sheet name="Sheet1" sheetId="1" r:id="rId1" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"/>
+</sheets>
+</workbook>`;
+
+		const workbookRels = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
+</Relationships>`;
+
+		const rels = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
+</Relationships>`;
+
+		const contentTypes = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+<Default Extension="xml" ContentType="application/xml"/>
+<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
+<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
+</Types>`;
+
+		const encoder = new TextEncoder();
+		const zipData = {
+			'[Content_Types].xml': encoder.encode(contentTypes),
+			'_rels/.rels': encoder.encode(rels),
+			'xl/workbook.xml': encoder.encode(workbookXml),
+			'xl/_rels/workbook.xml.rels': encoder.encode(workbookRels),
+			'xl/worksheets/sheet1.xml': encoder.encode(sheet1Xml)
+		};
+
+		return zipSyncFn(zipData);
+	};
 </script>
 
 <svelte:window onkeydown={handleWindowKeydown} onmousedown={handleWindowMouseDown} />
@@ -579,6 +779,76 @@
 					<span class="sm:hidden text-[10px] font-semibold">{selected.size}</span>
 				{/if}
 			</button>
+			{#if selected.size > 0}
+				<div class="relative inline-block text-left">
+					<button
+						type="button"
+						class="flex items-center gap-1.5 h-7 px-2 rounded-md text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors cursor-pointer"
+						onclick={() => (showActionMenu = !showActionMenu)}
+						title="Actions for selected rows"
+						aria-label="Actions for selected rows"
+					>
+						<Icon name="lucide:sliders-horizontal" class="w-3.5 h-3.5" />
+						<span class="hidden sm:inline">Actions</span>
+						<Icon name="lucide:chevron-down" class="w-3 h-3" />
+					</button>
+
+					{#if showActionMenu}
+						<div class="fixed inset-0 z-20" onclick={() => (showActionMenu = false)}></div>
+						<div class="absolute left-0 mt-1 w-48 rounded-md shadow-lg bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 py-1 z-30">
+							<div class="px-3 py-1.5 text-xs font-semibold text-slate-400 dark:text-slate-500 uppercase tracking-wider">
+								Copy to clipboard
+							</div>
+							<button
+								type="button"
+								class="w-full text-left flex items-center gap-2 px-3 py-1.5 text-sm text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-700 transition-colors cursor-pointer"
+								onclick={copySelectedAll}
+							>
+								<Icon name="lucide:copy" class="w-3.5 h-3.5 text-slate-400" />
+								<span>Copy All (JSON)</span>
+							</button>
+							<button
+								type="button"
+								class="w-full text-left flex items-center gap-2 px-3 py-1.5 text-sm text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-700 transition-colors cursor-pointer"
+								onclick={copySelectedXlsx}
+							>
+								<Icon name="lucide:file-spreadsheet" class="w-3.5 h-3.5 text-slate-400" />
+								<span>Copy XLSX (TSV)</span>
+							</button>
+							<button
+								type="button"
+								class="w-full text-left flex items-center gap-2 px-3 py-1.5 text-sm text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-700 transition-colors cursor-pointer"
+								onclick={copySelectedCsv}
+							>
+								<Icon name="lucide:file-text" class="w-3.5 h-3.5 text-slate-400" />
+								<span>Copy CSV</span>
+							</button>
+
+							<div class="border-t border-slate-100 dark:border-slate-700 my-1"></div>
+
+							<div class="px-3 py-1.5 text-xs font-semibold text-slate-400 dark:text-slate-500 uppercase tracking-wider">
+								Export file
+							</div>
+							<button
+								type="button"
+								class="w-full text-left flex items-center gap-2 px-3 py-1.5 text-sm text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-700 transition-colors cursor-pointer"
+								onclick={exportSelectedXlsx}
+							>
+								<Icon name="lucide:download" class="w-3.5 h-3.5 text-slate-400" />
+								<span>Export XLSX</span>
+							</button>
+							<button
+								type="button"
+								class="w-full text-left flex items-center gap-2 px-3 py-1.5 text-sm text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-700 transition-colors cursor-pointer"
+								onclick={exportSelectedCsv}
+							>
+								<Icon name="lucide:download" class="w-3.5 h-3.5 text-slate-400" />
+								<span>Export CSV</span>
+							</button>
+						</div>
+					{/if}
+				</div>
+			{/if}
 			{#if pendingChanges.size > 0}
 				<button
 					type="button"
