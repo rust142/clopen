@@ -84,6 +84,13 @@
 	let cellRowIdx = $state(-1);
 
 	const fkMap = $derived(new Map((details?.foreignKeys ?? []).map((fk) => [fk.column, fk])));
+	const gridColumns = $derived(
+		result && result.columns && result.columns.length > 0
+			? result.columns
+			: details && details.columns
+				? details.columns.map((c) => ({ name: c.name, type: c.type }))
+				: []
+	);
 
 	const cellFk = $derived(cellColumn ? fkMap.get(cellColumn) ?? null : null);
 	const cellNullable = $derived(
@@ -1013,7 +1020,7 @@
 	<div class="flex-1 min-h-0 overflow-auto">
 		{#if error}
 			<pre class="p-3 text-sm text-red-600 dark:text-red-400 whitespace-pre-wrap">{error}</pre>
-		{:else if result && (result.rows?.length ?? 0) > 0}
+		{:else if result}
 			<table class="w-full text-sm border-collapse bg-slate-50 dark:bg-slate-800/50">
 				<thead class="sticky top-0 bg-slate-200 dark:bg-slate-800 z-10">
 					<tr>
@@ -1021,7 +1028,7 @@
 							<Checkbox disabled={!hasPk} checked={selected.size > 0 && selected.size === result.rows.length} onchange={toggleAll} />
 						</th>
 						<th class="px-3 py-1.5 text-left font-semibold text-slate-500 border-b border-slate-200 dark:border-slate-800 w-10">#</th>
-						{#each result.columns as col (col.name)}
+						{#each gridColumns as col (col.name)}
 							<th class="px-3 py-1.5 text-left font-semibold text-slate-700 dark:text-slate-200 border-b border-slate-200 dark:border-slate-800">
 								<button
 									type="button"
@@ -1051,7 +1058,7 @@
 								<Checkbox disabled={!hasPk} checked={selected.has(i)} onchange={() => toggleSelect(i)} />
 							</td>
 							<td class="px-3 py-1.5 text-slate-400 border-b border-slate-100 dark:border-slate-800">{page * pageSize + i + 1}</td>
-							{#each result.columns as col (col.name)}
+							{#each gridColumns as col (col.name)}
 								{@const isEditing = editing?.rowIdx === i && editing.col === col.name}
 								{@const pendingVal = pendingChanges.get(pkKey(i))?.[col.name]}
 								{@const display = pendingVal !== undefined ? pendingVal : row[col.name]}
@@ -1118,11 +1125,15 @@
 								</td>
 							{/each}
 						</tr>
+					{:else}
+						<tr>
+							<td colspan={gridColumns.length + 2} class="px-4 py-8 text-center text-sm text-slate-400 dark:text-slate-500 bg-white/50 dark:bg-slate-900/10">
+								No rows.
+							</td>
+						</tr>
 					{/each}
 				</tbody>
 			</table>
-		{:else if result}
-			<div class="p-4 text-sm text-slate-400">No rows.</div>
 		{:else if loading}
 			<div class="p-4 text-sm text-slate-400">Loading…</div>
 		{/if}

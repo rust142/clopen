@@ -588,6 +588,13 @@
 					? 'lucide:key'
 					: 'lucide:table'
 	);
+	let renameQueryTabId = $state<string | null>(null);
+	let renameQueryText = $state('');
+
+	function focusInput(node: HTMLInputElement): void {
+		node.focus();
+		node.select();
+	}
 </script>
 
 <svelte:window on:resize={handleResize} />
@@ -729,8 +736,7 @@
 											? 'bg-violet-500/10 text-violet-700 dark:text-violet-300'
 											: 'text-slate-500 hover:text-slate-700 hover:bg-slate-100/50 dark:hover:bg-slate-800/40'}"
 									onclick={() => {
-										dbClientStore.setView(activeConnection.id, 'query');
-										dbClientStore.setActiveObject(activeConnection.id, null);
+										dbClientStore.setActiveQueryTab(activeConnection.id, 'default');
 									}}
 								>
 									<Icon name="lucide:code" class="w-3.5 h-3.5" />
