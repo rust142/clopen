@@ -107,12 +107,11 @@
 
 	function onObjectClick(node: DbClientSchemaNode, database?: string): void {
 		if (node.type === 'table' || node.type === 'collection' || node.type === 'view' || node.type === 'key') {
-			dbClientStore.setActiveObject(connectionId, {
+			dbClientStore.openTable(connectionId, {
 				name: node.name,
 				type: node.type,
 				database
 			});
-			dbClientStore.setView(connectionId, 'data');
 		}
 	}
 
@@ -165,6 +164,26 @@
 	}
 
 	const showingDatabases = $derived(useDatabaseTree && currentDb === null);
+
+	let searchQuery = $state('');
+
+	const filteredDatabases = $derived(
+		searchQuery.trim()
+			? databases.filter((db) => db.name.toLowerCase().includes(searchQuery.toLowerCase().trim()))
+			: databases
+	);
+
+	const filteredObjects = $derived(
+		searchQuery.trim()
+			? objects.filter((node) => node.name.toLowerCase().includes(searchQuery.toLowerCase().trim()))
+			: objects
+	);
+
+	$effect(() => {
+		void connectionId;
+		void currentDb;
+		searchQuery = '';
+	});
 </script>
 
 <div class="flex flex-col h-full min-h-0">
@@ -246,6 +265,28 @@
 		</div>
 	</div>
 
+	<div class="px-3 py-2 border-b border-slate-200 dark:border-slate-800 shrink-0">
+		<div class="flex items-center gap-2 px-2.5 py-1 bg-slate-100/80 dark:bg-slate-800/60 rounded-md">
+			<Icon name="lucide:search" class="w-3.5 h-3.5 text-slate-400 shrink-0" />
+			<input
+				type="text"
+				bind:value={searchQuery}
+				placeholder={showingDatabases ? "Search databases..." : "Search tables..."}
+				class="py-1 flex-1 bg-transparent border-none outline-none text-xs text-slate-900 dark:text-slate-100 placeholder:text-slate-400 min-w-0"
+			/>
+			{#if searchQuery}
+				<button
+					type="button"
+					class="text-slate-400 hover:text-slate-600 dark:hover:text-slate-200 shrink-0"
+					onclick={() => searchQuery = ''}
+					aria-label="Clear search"
+				>
+					<Icon name="lucide:x" class="w-3.5 h-3.5" />
+				</button>
+			{/if}
+		</div>
+	</div>
+
 	{#if createDbOpen}
 		<div class="px-3 py-2.5 border-b border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-800/40 shrink-0">
 			<div class="text-xs font-semibold text-slate-600 dark:text-slate-400 mb-1.5">New database</div>
@@ -293,7 +334,7 @@
 		{#if error}
 			<div class="px-3 py-2 text-sm text-red-600 dark:text-red-400">{error}</div>
 		{:else if showingDatabases}
-			{#each databases as db (db.name)}
+			{#each filteredDatabases as db (db.name)}
 				<button
 					type="button"
 					class="flex items-center gap-2 w-full px-2.5 py-1.5 rounded text-left text-sm hover:bg-slate-100 dark:hover:bg-slate-800/60 text-slate-700 dark:text-slate-300"
@@ -309,7 +350,7 @@
 				{/if}
 			{/each}
 		{:else}
-			{#each objects as node (node.name)}
+			{#each filteredObjects as node (node.name)}
 				<button
 					type="button"
 					class="flex items-center gap-2 w-full px-2.5 py-1.5 rounded text-left text-sm {isActiveNode(node.name, currentDb ?? undefined)
