@@ -99,7 +99,7 @@ const LANGUAGE_BY_EXTENSION: Record<string, string> = {
 	vue: 'html',
 
 	gitignore: 'plaintext',
-	env: 'plaintext',
+	env: 'env',
 	txt: 'plaintext',
 	log: 'plaintext',
 };
