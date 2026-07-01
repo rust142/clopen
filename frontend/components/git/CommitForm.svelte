@@ -41,6 +41,11 @@
 		onPush?: () => void;
 		onPull?: () => void;
 		onMoreAction?: (action: GitMoreAction) => void;
+		/** External control for branch name draft (survives remounts). */
+		branchDraft?: string;
+		showBranchDraft?: boolean;
+		onBranchDraftChange?: (val: string) => void;
+		onBranchDraftVisibleChange?: (val: boolean) => void;
 	}
 
 	const {
@@ -61,8 +66,14 @@
 		onCreateBranch,
 		onPush,
 		onPull,
-		onMoreAction
+		onMoreAction,
+		branchDraft: externalBranchDraft,
+		showBranchDraft: externalShowBranchDraft,
+		onBranchDraftChange,
+		onBranchDraftVisibleChange
 	}: Props = $props();
+
+	const isControlled = $derived(externalBranchDraft !== undefined);
 
 	const showSyncActions = $derived(Boolean(onPush || onPull));
 
@@ -85,8 +96,27 @@
 	const isGeneratingBranch = $derived(ops.isGeneratingBranch);
 	const isCreatingBranch = $derived(ops.isCreatingBranch);
 
-	let branchNameDraft = $state('');
-	let showBranchDraft = $state(false);
+	let localBranchNameDraft = $state('');
+	let localShowBranchDraft = $state(false);
+
+	const branchNameDraft = $derived(isControlled ? externalBranchDraft! : localBranchNameDraft);
+	const showBranchDraft = $derived(isControlled ? (externalShowBranchDraft ?? false) : localShowBranchDraft);
+
+	function updateBranchDraft(val: string) {
+		if (isControlled) {
+			onBranchDraftChange?.(val);
+		} else {
+			localBranchNameDraft = val;
+		}
+	}
+
+	function updateBranchDraftVisible(val: boolean) {
+		if (isControlled) {
+			onBranchDraftVisibleChange?.(val);
+		} else {
+			localShowBranchDraft = val;
+		}
+	}
 	let showGenerateDropdown = $state(false);
 	let showBranchSubmenu = $state(false);
 	let generateBtnEl = $state<HTMLButtonElement | null>(null);
@@ -305,8 +335,7 @@
 			});
 
 			let branchName = result.branchName;
-			
-			// Find the separator index that divides the prefix and the description
+
 			const sepIdx = branchSeparator ? branchName.indexOf(branchSeparator) : -1;
 			let prefix = '';
 			let description = branchName;
@@ -315,10 +344,8 @@
 				description = branchName.slice(sepIdx + branchSeparator.length);
 			}
 
-			// Format the description with the custom branch message separator (defaulting to '-')
 			let formattedDesc = description.split('-').join(msgSep);
 
-			// 2. Prepends the ticket ID if found
 			if (ticketId) {
 				if (formattedDesc) {
 					formattedDesc = `${ticketId}${msgSep}${formattedDesc}`;
@@ -329,8 +356,8 @@
 
 			branchName = `${prefix}${formattedDesc}`;
 
-			branchNameDraft = branchName;
-			showBranchDraft = true;
+			updateBranchDraft(branchName);
+			updateBranchDraftVisible(true);
 		} catch (err) {
 			showError('Generate Branch Failed', err instanceof Error ? err.message : 'Failed to generate branch name');
 		} finally {
@@ -346,8 +373,8 @@
 		try {
 			const created = await onCreateBranch(branchNameDraft.trim());
 			if (created !== false) {
-				branchNameDraft = '';
-				showBranchDraft = false;
+				updateBranchDraft('');
+				updateBranchDraftVisible(false);
 			}
 		} finally {
 			setGitOp(projectId, 'isCreatingBranch', false, repoPath);
@@ -692,7 +719,8 @@
 				<div class="min-w-0 flex-1 px-2.5">
 					<input
 						type="text"
-						bind:value={branchNameDraft}
+						value={branchNameDraft}
+						oninput={(e) => updateBranchDraft((e.target as HTMLInputElement).value)}
 						class="w-full bg-transparent border-none outline-none text-xs text-slate-700 dark:text-slate-200 placeholder:text-slate-400"
 						placeholder="dev/login"
 						disabled={isCreatingBranch}
@@ -718,7 +746,7 @@
 				<button
 					type="button"
 					class="flex items-center justify-center w-8 h-7 border-l border-slate-200 dark:border-slate-700 text-slate-400 hover:text-slate-600 hover:bg-slate-50 dark:hover:text-slate-300 dark:hover:bg-slate-700/50 transition-colors shrink-0"
-					onclick={() => { showBranchDraft = false; }}
+					onclick={() => { updateBranchDraftVisible(false); }}
 					disabled={isCreatingBranch}
 					aria-label="Cancel generated branch"
 				>
