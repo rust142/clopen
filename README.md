@@ -23,22 +23,24 @@
 </p>
 
 <p align="center">
-  <img src="https://clopen.myrialabs.dev/images/workspace-overview.webp" alt="Clopen workspace overview" />
+  <img src="https://clopen.myrialabs.dev/images/workspace.webp" alt="Clopen workspace overview" />
 </p>
 
-All-in-one workspace for AI coding agents — Claude Code, OpenCode, Codex, Copilot, and Qwen Code. Chat, terminal, git, browser preview, database client, and real-time collaboration, built for multi-project and multi-session workflows.
+All-in-one workspace for AI coding agents — Claude Code, OpenCode, Codex, Copilot, and Qwen Code. Chat, terminal, git, browser preview, database client, and real-time collaboration — plus Skills, Subagents, Commands, and MCP connectors to extend every engine.
 
 ---
 
 ## Screenshots
 
-![AI chat interface](https://clopen.myrialabs.dev/images/ai-chat-interface.webp)
+![AI chat interface](https://clopen.myrialabs.dev/images/chat-panel.webp)
 
-![Multi-account manager](https://clopen.myrialabs.dev/images/multi-account-claude-code.webp)
+![Engines and accounts](https://clopen.myrialabs.dev/images/engines-setting.webp)
 
-![Browser preview panel](https://clopen.myrialabs.dev/images/browser-preview-panel.webp)
+![Database client](https://clopen.myrialabs.dev/images/db-client.webp)
 
-![Checkpoint restore](https://clopen.myrialabs.dev/images/checkpoint-restore.webp)
+![Browser preview panel](https://clopen.myrialabs.dev/images/preview-panel.webp)
+
+![Checkpoint restore](https://clopen.myrialabs.dev/images/restore-checkpoint.webp)
 
 ---
 
@@ -56,7 +58,8 @@ A complete development environment designed around AI-assisted workflows, built 
 - **Real-Time Collaboration** — See who's working on which project, and collaborate live in the same codebase
 - **Monaco File Editor** — VS Code's editor right in the browser. Full syntax highlighting, autocomplete, and live file watching, beside your AI chat
 - **Cloudflare Tunnel** — One-click public HTTPS URL for your local dev server. Built-in QR code for instant mobile access. Share your work without deploying
-- **MCP Support** — Full Model Context Protocol integration. Connect AI tools, external APIs, and custom capabilities to your AI agents with zero friction
+- **Connectors (MCP)** — Browse a searchable catalog of Model Context Protocol servers, connect with OAuth or custom env/headers, and sync every connector across all your AI engines
+- **Skills, Commands & Subagents** — Build reusable Skills, slash Commands, delegated Subagents, shared Instructions, and tool Permissions or Profiles once, synced automatically across every engine
 - **Flexible Authentication** — No Login or With Login mode with admin/member roles, invite links, rate-limited login, and CLI token recovery
 - **System Tools Installer** — Install Git, Claude Code, OpenCode, Codex, Copilot, Qwen Code, Chrome, and Cloudflared (for Public Tunnel) from a one-click admin panel
 - **Background Processing** — Chat, terminal, and other processes continue running even when you close the browser — come back later and pick up where you left off
