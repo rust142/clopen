@@ -40,7 +40,15 @@ All-in-one workspace for AI coding agents — Claude Code, OpenCode, Codex, Copi
 
 ![Browser preview panel](https://clopen.myrialabs.dev/images/preview-panel.webp)
 
+![Connectors settings](https://clopen.myrialabs.dev/images/connectors-setting.webp)
+
+![Public tunnel](https://clopen.myrialabs.dev/images/public-tunnel.webp)
+
 ![Checkpoint restore](https://clopen.myrialabs.dev/images/restore-checkpoint.webp)
+
+### Works on Any Device
+
+<img src="https://clopen.myrialabs.dev/images/chat-panel-mobile.jpg" width="140" alt="AI Chat on mobile" /> <img src="https://clopen.myrialabs.dev/images/files-panel-mobile.jpg" width="140" alt="File Explorer on mobile" /> <img src="https://clopen.myrialabs.dev/images/git-panel-mobile.jpg" width="140" alt="Git on mobile" /> <img src="https://clopen.myrialabs.dev/images/terminal-panel-mobile.jpg" width="140" alt="Terminal on mobile" /> <img src="https://clopen.myrialabs.dev/images/preview-panel-mobile.jpg" width="140" alt="Browser Preview on mobile" /> <img src="https://clopen.myrialabs.dev/images/db-client-mobile.jpg" width="140" alt="Database Client on mobile" />
 
 ---
 
@@ -63,6 +71,7 @@ A complete development environment designed around AI-assisted workflows, built 
 - **Flexible Authentication** — No Login or With Login mode with admin/member roles, invite links, rate-limited login, and CLI token recovery
 - **System Tools Installer** — Install Git, Claude Code, OpenCode, Codex, Copilot, Qwen Code, Chrome, and Cloudflared (for Public Tunnel) from a one-click admin panel
 - **Background Processing** — Chat, terminal, and other processes continue running even when you close the browser — come back later and pick up where you left off
+- **Works on Any Device** — Fully responsive across desktop, laptop, tablet, and mobile. Open your workspace from any device and continue exactly where you left off
 
 ---
 
