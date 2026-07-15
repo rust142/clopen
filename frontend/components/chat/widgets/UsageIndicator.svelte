@@ -14,6 +14,7 @@
 	import { copilotAccountsStore } from '$frontend/stores/features/copilot-accounts.svelte';
 	import { codexAccountsStore } from '$frontend/stores/features/codex-accounts.svelte';
 	import { opencodeProvidersStore } from '$frontend/stores/features/opencode-providers.svelte';
+	import { sessionState } from '$frontend/stores/core/sessions.svelte';
 
 	interface Props {
 		isMobile?: boolean;
@@ -95,6 +96,8 @@
 	$effect(() => {
 		const engine = chatModelState.engine;
 		const accountId = chatModelState.accountId;
+		// Track message generation loading state to trigger updates
+		sessionState.isLoading;
 		if (engine && hasAccounts) {
 			fetchUsage(engine, accountId ?? undefined);
 		}
@@ -108,17 +111,23 @@
 	});
 </script>
 
-{#if chatModelState.engine !== 'qwen' && hasAccounts && (remainingPercent !== undefined || isLoading)}
+{#if chatModelState.engine !== 'qwen' && hasAccounts}
 	<div class="relative" bind:this={containerRef}>
 		<button
 			type="button"
 			class="flex items-center justify-center px-1.5 {isMobile ? 'h-8' : 'h-6'} bg-transparent border-none rounded-md text-slate-500 cursor-pointer transition-all duration-150 hover:bg-violet-500/10 hover:text-slate-900 dark:hover:text-slate-100 group"
 			onclick={togglePopover}
-			title={remainingPercent !== undefined ? `Quota: ${Math.round(remainingPercent)}% left` : 'Loading quota...'}
+			title={remainingPercent !== undefined ? `Quota: ${Math.round(remainingPercent)}% left` : usageError ? `Error: ${usageError}` : 'Loading quota...'}
 		>
 			<div class="flex items-center gap-1.5">
 				{#if isLoading && remainingPercent === undefined}
 					<Icon name="lucide:loader" class="w-3.5 h-3.5 animate-spin" />
+				{:else if usageError}
+					<!-- Error/Failed state: warning icon -->
+					<div class="flex items-center gap-1 text-rose-500 dark:text-rose-400">
+						<Icon name="lucide:triangle-alert" class="w-3.5 h-3.5" />
+						<span class="text-2xs font-semibold @max-[32rem]:hidden">Error</span>
+					</div>
 				{:else if remainingPercent !== undefined}
 					<!-- Default: Gauge + % text -->
 					<div class="flex items-center gap-1.5 @max-[32rem]:hidden">
