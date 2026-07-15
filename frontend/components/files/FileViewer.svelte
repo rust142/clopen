@@ -11,7 +11,7 @@
 	import { getFolderIcon } from '$frontend/utils/folder-icon-mappings';
 	import { isImageFile, isSvgFile, isPdfFile, isAudioFile, isVideoFile, isBinaryFile, isBinaryContent, isPreviewableFile, isEditableImageFile } from '$frontend/utils/file-type';
 	import { formatFileSize } from '$frontend/utils/format';
-	import { onMount } from 'svelte';
+	import { onMount, untrack } from 'svelte';
 	import type { IconName } from '$shared/types/ui/icons';
 	import type { editor } from 'monaco-editor';
 	import { debug } from '$shared/utils/logger';
@@ -20,6 +20,8 @@
 	import { gitStatusState } from '$frontend/stores/features/git-status.svelte';
 	import { settings } from '$frontend/stores/features/settings.svelte';
 	import { revealFile } from '$frontend/stores/ui/file-peek.svelte';
+	import { getAiChanges, clearAiChange, onAiChange, onAiScrollReveal, consumeAiScrollReveal, getGutterViewMode, setGutterViewMode, onGutterViewModeChange } from '$frontend/utils/ai-changes';
+	import type { GutterViewMode } from '$frontend/utils/ai-changes';
 
 	// Interface untuk MonacoCodeEditor component
 	interface MonacoEditorComponent {
@@ -150,9 +152,15 @@
 
 	// Git gutter decorations + HEAD content cache
 	let gutterDecorations: string[] = [];
+	let aiChangeDecorations: string[] = [];
 	let envDecorations: string[] = [];
 	let envDecoEditor: editor.IStandaloneCodeEditor | null = null;
 	let gutterChanges: GutterChange[] = [];
+	let aiGutterChanges: GutterChange[] = [];
+	let activeRevealEditIdx = $state<number | null>(null);
+	let lastRevealEditIdx = $state<number | null>(null);
+	let hasAiChanges = $state(false);
+	let gutterMode = $state<GutterViewMode>(getGutterViewMode());
 	let headContent = $state<string | null>(null);
 	let headContentForPath = '';
 	let pendingScrollRestore: number | null = null;
@@ -162,6 +170,7 @@
 	let activeDiffZone: {
 		id: string;
 		line: number;
+		isAi: boolean;
 		escHandler: (e: KeyboardEvent) => void;
 		domNode: HTMLElement;
 		overlayWidget: editor.IOverlayWidget;
@@ -360,11 +369,19 @@
 		if (!path || !projectId) {
 			headContent = null;
 			headContentForPath = '';
+			activeRevealEditIdx = null;
+			lastRevealEditIdx = null;
+			setGutterViewMode('git');
+			closeDiffPeek();
 			return;
 		}
 		if (path === headContentForPath) return;
 		headContentForPath = path;
 		headContent = null;
+		activeRevealEditIdx = null;
+		lastRevealEditIdx = null;
+		setGutterViewMode('git');
+		closeDiffPeek();
 
 		// Only fetch when git is tracking this file
 		if (!gitStatusState.isRepo) return;
@@ -400,6 +417,169 @@
 		}
 	});
 
+	// React to gutter view mode changes (AI vs Git)
+	$effect(() => {
+		const mode = gutterMode;
+		const editor = monacoEditorRef?.getEditor();
+		if (!editor) return;
+		if (mode === 'ai') {
+			untrack(() => {
+				if (activeRevealEditIdx === null && lastRevealEditIdx === null) {
+					const allChanges = getAiChanges(file?.path || '');
+					if (allChanges.length > 0) {
+						activeRevealEditIdx = allChanges.length - 1;
+						lastRevealEditIdx = allChanges.length - 1;
+					}
+				}
+			});
+			applyAiChangeDecorations();  // re-apply AI gutter
+			updateGutterDecorations(true); // clear git gutter
+		} else {
+			applyAiChangeDecorations(true); // clear AI gutter
+			scheduleGutterUpdate();
+			if (activeDiffZone && activeDiffZone.isAi) {
+				closeDiffPeek();
+			}
+		}
+	});
+
+	// Sync with external preference changes
+	onMount(() => {
+		const unsub = onGutterViewModeChange((mode) => {
+			gutterMode = mode;
+		});
+		return unsub;
+	});
+
+	// AI change decorations — highlight lines modified by AI (Write/Edit tools)
+	function applyAiChangeDecorations(forceClear = false) {
+		const editor = monacoEditorRef?.getEditor();
+		if (!editor) return;
+
+		const path = file?.path || '';
+		if (!path) {
+			aiChangeDecorations = editor.deltaDecorations(aiChangeDecorations, []);
+			hasAiChanges = false;
+			return;
+		}
+
+		const allChanges = getAiChanges(path);
+		hasAiChanges = allChanges.length > 0;
+
+		// Capture scroll-reveal edit index first so we can filter by it on this pass
+		const revealEditIdx = consumeAiScrollReveal(path);
+		if (revealEditIdx >= 0) {
+			activeRevealEditIdx = revealEditIdx;
+			lastRevealEditIdx = revealEditIdx;
+			setGutterViewMode('ai');
+		}
+
+		if (forceClear || gutterMode === 'git') {
+			aiChangeDecorations = editor.deltaDecorations(aiChangeDecorations, []);
+			aiGutterChanges = [];
+			return;
+		}
+
+		if (allChanges.length === 0) {
+			aiChangeDecorations = editor.deltaDecorations(aiChangeDecorations, []);
+			return;
+		}
+
+		const merged: Array<GutterChange & { _editIdx: number; _timestamp: number }> = [];
+
+		for (let editIdx = 0; editIdx < allChanges.length; editIdx++) {
+			if (activeRevealEditIdx !== null && editIdx !== activeRevealEditIdx) continue;
+
+			const change = allChanges[editIdx];
+			const rawChanges = change.oldContent
+				? computeLineDiff(change.oldContent, change.newContent)
+				: computeLineDiff('', change.newContent);
+
+			let local: GutterChange[];
+			if (!change.oldContent) {
+				local = rawChanges;
+			} else {
+				const idx = editableContent.indexOf(change.newContent);
+				if (idx >= 0) {
+					const beforeContent = editableContent.substring(0, idx);
+					const startLine = beforeContent.split('\n').length;
+					local = rawChanges.map((c) => ({
+						...c,
+						startLine: c.startLine + startLine - 1,
+						endLine: c.endLine + startLine - 1
+					}));
+				} else {
+					local = [];
+				}
+			}
+
+			for (const gc of local) {
+				merged.push({ ...gc, _editIdx: editIdx, _timestamp: change.timestamp });
+			}
+		}
+
+		const newDecorations = merged.map((entry) => {
+			const { _editIdx, _timestamp, ...change } = entry;
+
+			const options: any = {
+				isWholeLine: false,
+				linesDecorationsClassName: `ai-gutter-${change.type}`,
+				overviewRuler: {
+					color: colorForChangeType(change.type),
+					position: OVERVIEW_RULER_RIGHT
+				}
+			};
+
+			return {
+				range: {
+					startLineNumber: change.startLine,
+					startColumn: 1,
+					endLineNumber: change.endLine,
+					endColumn: 1
+				},
+				options
+			};
+		});
+
+		// Store tagged changes for peek
+		aiGutterChanges = merged.map(({ _editIdx, _timestamp, ...change }) => ({
+			...change,
+			editIndex: _editIdx,
+			timestamp: _timestamp,
+		}));
+		aiChangeDecorations = editor.deltaDecorations(aiChangeDecorations, newDecorations);
+
+		// Scroll-reveal: focus on the first line of the specific edit the user clicked
+		if (revealEditIdx >= 0 && aiGutterChanges.length > 0) {
+			const targetChange = aiGutterChanges.find((g) => g.editIndex === revealEditIdx)
+				?? aiGutterChanges[0];
+			requestAnimationFrame(() => {
+				editor.revealLineInCenter(targetChange.startLine);
+				editor.setPosition({ lineNumber: targetChange.startLine, column: 1 });
+				editor.focus();
+				showDiffPeek(targetChange, true);
+			});
+		}
+
+	}
+
+	// Register callback for AI change notifications (fires when a new change arrives)
+	onMount(() => {
+		const unregister = onAiChange(() => {
+			applyAiChangeDecorations();
+		});
+		const unregisterReveal = onAiScrollReveal((revealPath) => {
+			const currentPath = file?.path || '';
+			if (revealPath === currentPath) {
+				applyAiChangeDecorations();
+			}
+		});
+		return () => {
+			unregister();
+			unregisterReveal();
+		};
+	});
+
 	function scheduleGutterUpdate() {
 		if (gutterUpdateTimer) clearTimeout(gutterUpdateTimer);
 		gutterUpdateTimer = setTimeout(() => {
@@ -415,15 +595,26 @@
 		return type === 'added' ? '#10b981' : type === 'modified' ? '#3b82f6' : '#ef4444';
 	}
 
-	function updateGutterDecorations() {
+	function updateGutterDecorations(forceClear = false) {
 		const editor = monacoEditorRef?.getEditor();
 		if (!editor) return;
+
+		if (forceClear || gutterMode === 'ai') {
+			gutterChanges = [];
+			gutterDecorations = editor.deltaDecorations(gutterDecorations, []);
+			if (activeDiffZone && !activeDiffZone.isAi) {
+				closeDiffPeek();
+			}
+			return;
+		}
 
 		// No HEAD content (untracked, missing repo) — clear any existing gutter
 		if (headContent === null || headContent === undefined) {
 			gutterChanges = [];
 			gutterDecorations = editor.deltaDecorations(gutterDecorations, []);
-			closeDiffPeek();
+			if (activeDiffZone && !activeDiffZone.isAi) {
+				closeDiffPeek();
+			}
 			return;
 		}
 
@@ -431,7 +622,7 @@
 		gutterChanges = changes;
 
 		// Close any open peek whose anchor line is no longer marked as changed
-		if (activeDiffZone) {
+		if (activeDiffZone && !activeDiffZone.isAi) {
 			const stillExists = changes.some(
 				(c) => activeDiffZone!.line >= c.startLine && activeDiffZone!.line <= c.endLine
 			);
@@ -465,9 +656,12 @@
 		gutterDecorations = editor.deltaDecorations(gutterDecorations, newDecorations);
 	}
 
-	function findChangeAtLine(line: number): GutterChange | null {
+	function findChangeAtLine(line: number): { change: GutterChange; isAi: boolean } | null {
 		for (const change of gutterChanges) {
-			if (line >= change.startLine && line <= change.endLine) return change;
+			if (line >= change.startLine && line <= change.endLine) return { change, isAi: false };
+		}
+		for (const change of aiGutterChanges) {
+			if (line >= change.startLine && line <= change.endLine) return { change, isAi: true };
 		}
 		return null;
 	}
@@ -545,13 +739,15 @@
 		});
 	}
 
-	function buildPeekDom(change: GutterChange): HTMLElement {
+	function buildPeekDom(change: GutterChange, isAi = false): HTMLElement {
 		const root = document.createElement('div');
 		root.className = `git-diff-peek git-diff-peek-${change.type}`;
 
 		const inner = document.createElement('div');
 		inner.className = 'git-diff-peek-inner';
 		root.appendChild(inner);
+
+
 
 		// Old (HEAD) lines — red background, shown for deletions and modifications
 		if (change.oldLines.length > 0) {
@@ -691,7 +887,8 @@
 	function buildPeekOverlayHeader(
 		change: GutterChange,
 		index: number,
-		total: number
+		total: number,
+		isAi = false
 	): HTMLElement {
 		const root = document.createElement('div');
 		root.className = `git-diff-peek-overlay-header git-diff-peek-overlay-header-${change.type}`;
@@ -725,14 +922,16 @@
 		attachPeekButton(nextBtn, () => navigatePeek(1));
 		actions.appendChild(nextBtn);
 
-		const discardBtn = document.createElement('button');
-		discardBtn.className = 'git-diff-peek-discard-btn';
-		discardBtn.type = 'button';
-		discardBtn.title = 'Discard this change (revert to HEAD)';
-		discardBtn.setAttribute('aria-label', 'Discard this change');
-		discardBtn.innerHTML = `${ICON_DISCARD}<span>Discard</span>`;
-		attachPeekButton(discardBtn, () => discardHunk(change));
-		actions.appendChild(discardBtn);
+		if (!isAi) {
+			const discardBtn = document.createElement('button');
+			discardBtn.className = 'git-diff-peek-discard-btn';
+			discardBtn.type = 'button';
+			discardBtn.title = 'Discard this change (revert to HEAD)';
+			discardBtn.setAttribute('aria-label', 'Discard this change');
+			discardBtn.innerHTML = `${ICON_DISCARD}<span>Discard</span>`;
+			attachPeekButton(discardBtn, () => discardHunk(change));
+			actions.appendChild(discardBtn);
+		}
 
 		const closeBtn = document.createElement('button');
 		closeBtn.className = 'git-diff-peek-iconbtn git-diff-peek-close';
@@ -748,18 +947,20 @@
 	}
 
 	function navigatePeek(direction: 1 | -1) {
-		if (!activeDiffZone || gutterChanges.length === 0) return;
+		if (!activeDiffZone) return;
+		const changes = getActiveChanges(activeDiffZone.isAi);
+		if (changes.length === 0) return;
 		const currentLine = activeDiffZone.line;
-		const currentIdx = gutterChanges.findIndex(
+		const currentIdx = changes.findIndex(
 			(c) => c.startLine === currentLine
 		);
 		if (currentIdx === -1) return;
 		const nextIdx =
-			(currentIdx + direction + gutterChanges.length) % gutterChanges.length;
-		const next = gutterChanges[nextIdx];
+			(currentIdx + direction + changes.length) % changes.length;
+		const next = changes[nextIdx];
 		const editor = monacoEditorRef?.getEditor();
 		if (editor) editor.revealLineInCenter(next.startLine);
-		showDiffPeek(next);
+		showDiffPeek(next, activeDiffZone.isAi);
 	}
 
 	function applyPeekSizing(editorInstance: editor.IStandaloneCodeEditor, domNode: HTMLElement) {
@@ -783,17 +984,19 @@
 		domNode.style.transform = `translateX(${scrollLeft}px)`;
 	}
 
-	function showDiffPeek(change: GutterChange) {
+	function showDiffPeek(change: GutterChange, isAi = false) {
 		const editorInstance = monacoEditorRef?.getEditor();
 		if (!editorInstance) return;
 
 		closeDiffPeek();
 
-		const index = gutterChanges.indexOf(change) + 1;
-		const total = gutterChanges.length;
-		const domNode = buildPeekDom(change);
+		const changes = getActiveChanges(isAi);
+		const foundIdx = changes.findIndex(c => c.startLine === change.startLine && c.type === change.type);
+		const index = foundIdx >= 0 ? foundIdx + 1 : 1;
+		const total = changes.length;
+		const domNode = buildPeekDom(change, isAi);
 		const marginDomNode = buildPeekMargin(change);
-		const overlayHeader = buildPeekOverlayHeader(change, index, total);
+		const overlayHeader = buildPeekOverlayHeader(change, index, total, isAi);
 		applyPeekSizing(editorInstance, domNode);
 		applyPeekScroll(domNode, editorInstance.getScrollLeft());
 
@@ -921,6 +1124,7 @@
 		activeDiffZone = {
 			id: zoneId,
 			line: change.startLine,
+			isAi,
 			escHandler,
 			domNode,
 			overlayWidget,
@@ -928,6 +1132,26 @@
 			layoutDispose: () => layoutDisposable.dispose(),
 			detachSwallow
 		};
+	}
+
+	function getActiveChanges(isAi: boolean): GutterChange[] {
+		return isAi ? aiGutterChanges : gutterChanges;
+	}
+
+	function refreshActiveDiffPeek() {
+		if (!activeDiffZone) return;
+		const isAi = activeDiffZone.isAi;
+		const changes = getActiveChanges(isAi);
+		if (changes.length === 0) {
+			closeDiffPeek();
+			return;
+		}
+		const targetChange = changes[0];
+		showDiffPeek(targetChange, isAi);
+		const editor = monacoEditorRef?.getEditor();
+		if (editor) {
+			editor.revealLineInCenterIfOutsideViewport(targetChange.startLine);
+		}
 	}
 
 	function closeDiffPeek() {
@@ -954,12 +1178,13 @@
 			if (e.target.type !== GUTTER_LINE_DECORATIONS) return;
 			const line = e.target.position?.lineNumber;
 			if (!line) return;
-			const change = findChangeAtLine(line);
-			if (!change) return;
+			const found = findChangeAtLine(line);
+			if (!found) return;
+			const { change, isAi } = found;
 			if (activeDiffZone && activeDiffZone.line === change.startLine) {
 				closeDiffPeek();
 			} else {
-				showDiffPeek(change);
+				showDiffPeek(change, isAi);
 			}
 		});
 		gutterClickDispose = () => disposable.dispose();
@@ -1003,6 +1228,7 @@
 		// Reset decoration ids — the prior editor instance is gone so its ids
 		// are no longer valid.
 		gutterDecorations = [];
+		aiChangeDecorations = [];
 
 		// Previous editor's view zones are gone with the disposed instance
 		if (activeDiffZone) {
@@ -1044,6 +1270,7 @@
 		}
 
 		scheduleGutterUpdate();
+		applyAiChangeDecorations();
 	}
 
 	// Handle content changes from editor
@@ -1051,14 +1278,25 @@
 		hasChanges = newContent !== referenceContent;
 		onContentChange?.(newContent);
 		// User edits invalidate the captured HEAD-side hunk in the peek; close it
-		// so the next click reflects the up-to-date diff.
 		if (activeDiffZone) closeDiffPeek();
 		scheduleGutterUpdate();
+		// Clear AI change highlights when user starts editing
+		if (file?.path) {
+			clearAiChange(file.path);
+			const editor = monacoEditorRef?.getEditor();
+			if (editor) aiChangeDecorations = editor.deltaDecorations(aiChangeDecorations, []);
+		}
 	}
 
-	// Expose scroll position to parent (FilesPanel snapshots it on tab switches)
 	export function getEditorScrollTop(): number {
 		return monacoEditorRef?.getScrollTop?.() ?? 0;
+	}
+
+	export function resetRevealFilter() {
+		activeRevealEditIdx = null;
+		lastRevealEditIdx = null;
+		setGutterViewMode('git');
+		closeDiffPeek();
 	}
 
 	// Update Monaco word wrap when prop changes
@@ -1394,6 +1632,50 @@
 							<Icon name="lucide:wrap-text" class="w-4 h-4" />
 						</button>
 					{/if}
+					<!-- Gutter view mode toggle: AI changes vs Git changes -->
+					{#if hasAiChanges}
+						<button
+							class="flex p-2 rounded-lg transition-all duration-200 {gutterMode === 'ai' ?
+								'text-violet-600 dark:text-violet-400 bg-violet-100 dark:bg-violet-900/50' :
+								'text-sky-600 dark:text-sky-400 bg-sky-100 dark:bg-sky-900/50'
+							}"
+							onclick={() => setGutterViewMode(gutterMode === 'ai' ? 'git' : 'ai')}
+							title={gutterMode === 'ai' ? 'Showing AI changes — click for Git changes' : 'Showing Git changes — click for AI changes'}
+						>
+							<Icon name={gutterMode === 'ai' ? 'lucide:sparkles' : 'lucide:git-branch'} class="w-4 h-4" />
+						</button>
+					{/if}
+
+					{#if gutterMode === 'ai' && lastRevealEditIdx !== null}
+						{#if activeRevealEditIdx !== null}
+							<button
+								class="flex items-center justify-center gap-1.5 h-8 px-2.5 text-xs font-semibold rounded-lg text-amber-700 bg-amber-50 dark:text-amber-300 dark:bg-amber-950/40 border border-amber-200/60 dark:border-amber-900/40 hover:bg-amber-100 dark:hover:bg-amber-950/60 transition-all duration-200"
+								onclick={() => {
+									activeRevealEditIdx = null;
+									applyAiChangeDecorations();
+									refreshActiveDiffPeek();
+								}}
+								title="Clear filter — show all AI edits"
+							>
+								<Icon name="lucide:filter" class="w-3.5 h-3.5" />
+								<span>Filtered</span>
+								<Icon name="lucide:x" class="w-3 h-3" />
+							</button>
+						{:else}
+							<button
+								class="flex items-center justify-center gap-1.5 h-8 px-2.5 text-xs font-semibold rounded-lg text-slate-600 hover:text-slate-800 dark:text-slate-400 dark:hover:text-slate-200 bg-slate-50 hover:bg-slate-100 dark:bg-slate-800/40 dark:hover:bg-slate-800/80 border border-slate-200 dark:border-slate-700 transition-all duration-200"
+								onclick={() => {
+									activeRevealEditIdx = lastRevealEditIdx;
+									applyAiChangeDecorations();
+									refreshActiveDiffPeek();
+								}}
+								title="Filter by last clicked AI edit"
+							>
+								<Icon name="lucide:filter" class="w-3.5 h-3.5" />
+								<span>Filter</span>
+							</button>
+						{/if}
+					{/if}
 					<!-- Save button -->
 					<button
 						class="flex p-2 text-green-600 dark:text-green-400 hover:text-green-700 dark:hover:text-green-300 hover:bg-green-50 dark:hover:bg-green-900/30 rounded-lg transition-all duration-200 {saveButtonDisabled ? 'opacity-50 cursor-not-allowed' : ''}"
@@ -1662,6 +1944,46 @@
 		filter: brightness(1.15);
 	}
 	:global(.git-gutter-deleted:hover) {
+		margin-left: 1px;
+		border-top-width: 6px;
+		border-right-width: 6px;
+		filter: brightness(1.15);
+	}
+
+	/* AI gutter decorations — same colors as Git changes (green/blue/red) */
+	:global(.ai-gutter-added) {
+		background-color: #10b981;
+		width: 3px !important;
+		margin-left: 3px;
+	}
+	:global(.ai-gutter-modified) {
+		background-color: #3b82f6;
+		width: 3px !important;
+		margin-left: 3px;
+	}
+	:global(.ai-gutter-deleted) {
+		width: 0 !important;
+		margin-left: 3px;
+		border-top: 4px solid #ef4444;
+		border-right: 4px solid transparent;
+		height: 0 !important;
+	}
+	:global(.dark .ai-gutter-added) {
+		background-color: #059669;
+	}
+	:global(.dark .ai-gutter-modified) {
+		background-color: #2563eb;
+	}
+	:global(.dark .ai-gutter-deleted) {
+		border-top-color: #dc2626;
+	}
+	:global(.ai-gutter-added:hover),
+	:global(.ai-gutter-modified:hover) {
+		width: 6px !important;
+		margin-left: 1px;
+		filter: brightness(1.15);
+	}
+	:global(.ai-gutter-deleted:hover) {
 		margin-left: 1px;
 		border-top-width: 6px;
 		border-right-width: 6px;

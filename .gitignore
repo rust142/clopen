@@ -54,3 +54,7 @@ temp-videos/
 /okegas
 /okegas (1)
 /okegas (2)
+
+# Geeto state files
+.geeto
+geeto*

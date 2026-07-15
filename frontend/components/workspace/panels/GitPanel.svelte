@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { onMount, untrack } from 'svelte';
+	import { onAiFilesChange } from '$frontend/utils/ai-changes';
 	import Icon from '$frontend/components/common/display/Icon.svelte';
 	import Modal from '$frontend/components/common/overlay/Modal.svelte';
 	import Dialog from '$frontend/components/common/overlay/Dialog.svelte';
@@ -61,6 +62,7 @@
 	let isRepo = $state(false);
 	let isLoading = $state(false);
 	let gitStatus = $state<GitStatus>({ staged: [], unstaged: [], untracked: [], conflicted: [] });
+	let aiChangesSet = $state(new Set<string>());
 	let branchInfo = $state<GitBranchInfo | null>(null);
 
 	// Action-bar busy flags are keyed per-project in the workspace store, so an
@@ -3558,6 +3560,10 @@ ${bodies}`;
 
 	// Monitor container width
 	onMount(() => {
+		const unsubAiFiles = onAiFilesChange((paths) => {
+			aiChangesSet = new Set(paths);
+		});
+
 		let resizeObserver: ResizeObserver | null = null;
 		if (containerRef && typeof ResizeObserver !== 'undefined') {
 			resizeObserver = new ResizeObserver((entries) => {
@@ -3569,6 +3575,7 @@ ${bodies}`;
 		}
 
 		return () => {
+			unsubAiFiles();
 			resizeObserver?.disconnect();
 		};
 	});
@@ -3855,7 +3862,8 @@ ${bodies}`;
 							activeSection={activeTab?.section ?? null}
 							onViewDiff={(file, sec) => viewDiff(file, sec)}
 							onResolve={(path) => openConflictResolver(path)}
-						/>
+												{aiChangesSet}
+/>
 					{/if}
 					<ChangesSection
 						title="Staged Changes"
@@ -3868,7 +3876,8 @@ ${bodies}`;
 						onUnstageAll={async () => { if (projectId) { try { await ws.http('git:unstage-all', { projectId, repoPath: nested.path }); await loadStatus(); } catch (err) { debug.error('git', 'Failed to unstage all in nested repo:', err); } } }}
 						onStash={() => openStashPrompt('staged', nested.path)}
 						onViewDiff={(file, sec) => viewDiff(file, sec)}
-					/>
+										{aiChangesSet}
+/>
 					<ChangesSection
 						title="Changes"
 						icon="lucide:file-pen"
@@ -3881,7 +3890,8 @@ ${bodies}`;
 						onDiscard={(path) => discardFile(path)}
 						onDiscardAll={async () => { if (projectId) { try { await ws.http('git:discard-all', { projectId, repoPath: nested.path }); await loadStatus(); } catch (err) { debug.error('git', 'Failed to discard all in nested repo:', err); } } }}
 						onViewDiff={(file, sec) => viewDiff(file, sec)}
-					/>
+										{aiChangesSet}
+/>
 					{#if nestedTotalChanges === 0 && !isLoading}
 						<div class="flex flex-col items-center justify-center gap-2 py-6 text-slate-500 text-xs">
 							<Icon name="lucide:circle-check" class="w-5 h-5 opacity-30" />
@@ -4729,6 +4739,7 @@ ${bodies}`;
 					activeSection={activeTab?.section ?? null}
 					onViewDiff={viewDiff}
 					onResolve={openConflictResolver}
+					{aiChangesSet}
 				/>
 			{/if}
 
@@ -4743,6 +4754,7 @@ ${bodies}`;
 				onUnstageAll={unstageAll}
 				onStash={() => openStashPrompt('staged')}
 				onViewDiff={viewDiff}
+				{aiChangesSet}
 			/>
 
 			<!--
@@ -4766,6 +4778,7 @@ ${bodies}`;
 				onDiscard={discardFile}
 				onDiscardAll={discardAll}
 				onViewDiff={viewDiff}
+				{aiChangesSet}
 			/>
 
 			{#if mainStagedFiles.length === 0 && mainAllChanges.length === 0 && mainConflictedFiles.length === 0 && !isLoading && !(branchInfo?.nested?.length)}

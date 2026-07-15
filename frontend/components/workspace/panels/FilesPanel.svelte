@@ -80,6 +80,7 @@
 	import { getGitStatusLabel, getGitStatusColor } from '$frontend/utils/git-status';
 	import type { IconName } from '$shared/types/ui/icons';
 	import { fileState, clearRevealRequest, collapseAllTrigger } from '$frontend/stores/core/files.svelte';
+	import { onAiFilesChange } from '$frontend/utils/ai-changes';
 	import {
 		gitStatusState,
 		initGitStatus,
@@ -113,6 +114,9 @@
 	let isInitialLoad = $state(true);
 	let error = $state('');
 	let expandedFolders = $state(new Set<string>());
+
+	// AI changes set for explorer dot indicators
+	let aiChangesSet = $state(new Set<string>());
 
 	// Watch global collapse-all signal
 	$effect(() => {
@@ -495,6 +499,9 @@
 	function openFileInTab(file: FileNode, target?: { line: number; column?: number; length?: number }) {
 		if (file.type === 'directory') return;
 
+		// Reset active AI reveal filter on normal file tree/tab navigation
+		fileViewerRef?.resetRevealFilter?.();
+
 		// Snapshot current active tab's editor scroll before switching
 		snapshotActiveTabScroll();
 
@@ -564,6 +571,9 @@
 	}
 
 	function selectTab(path: string) {
+		// Reset active AI reveal filter on normal file tree/tab navigation
+		fileViewerRef?.resetRevealFilter?.();
+
 		// Snapshot current active tab's editor scroll before switching away
 		snapshotActiveTabScroll();
 
@@ -2271,6 +2281,11 @@
 		initGitStatus();
 		initIgnoredPaths();
 
+		// Subscribe to AI changes for explorer dot indicators
+		const unsubAiFiles = onAiFilesChange((paths) => {
+			aiChangesSet = new Set(paths);
+		});
+
 		// Safety-net reconcile when the user returns to the app/tab. File-watch
 		// push events can be missed while the window is hidden (OS throttling,
 		// sleep/wake, dropped events); reconciling on focus re-establishes truth
@@ -2291,6 +2306,7 @@
 		}
 
 		return () => {
+			unsubAiFiles();
 			if (typeof window !== 'undefined') {
 				window.removeEventListener('focus', scheduleReconcile);
 				document.removeEventListener('visibilitychange', handleVisibilityChange);
@@ -2487,6 +2503,7 @@
 							{isRootDropTarget}
 							{busyPaths}
 							{isRootBusy}
+							{aiChangesSet}
 						/>
 					</div>
 				</div>
