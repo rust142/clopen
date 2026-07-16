@@ -3658,7 +3658,7 @@ ${bodies}`;
 				</div>
 			</div>
 			{#if !branch.isCurrent}
-			<div class="pointer-events-none absolute inset-y-0 right-0 flex items-center gap-1 pl-1 pr-2 bg-white/20 opacity-0 backdrop-blur-md supports-[backdrop-filter]:bg-white/10 transition-opacity group-hover:opacity-100 dark:bg-slate-900/20 dark:supports-[backdrop-filter]:bg-slate-900/10">
+			<div class="absolute inset-y-0 right-0 flex items-center gap-1 pl-1 pr-2 bg-white/20 backdrop-blur-md supports-[backdrop-filter]:bg-white/10 transition-opacity dark:bg-slate-900/20 dark:supports-[backdrop-filter]:bg-slate-900/10 {pushingBranch === branch.name ? 'opacity-100 pointer-events-auto' : 'pointer-events-none opacity-0 group-hover:opacity-100'}">
 				<button type="button" class="pointer-events-auto flex items-center justify-center w-7 h-7 rounded-md text-slate-400 hover:bg-violet-500/10 hover:text-violet-500 transition-colors bg-transparent border-none cursor-pointer" onclick={(e) => { e.stopPropagation(); handleSwitchNestedBranch(nested, branch.name); }} title="Switch to this branch"><Icon name="lucide:arrow-right" class="w-3.5 h-3.5" /></button>
 				{#if !nestedPushed.has(branch.name)}
 					{#if pushingBranch === branch.name}
@@ -3671,7 +3671,7 @@ ${bodies}`;
 			<button type="button" class="pointer-events-auto flex items-center justify-center w-7 h-7 rounded-md text-slate-400 hover:bg-red-500/10 hover:text-red-500 transition-colors bg-transparent border-none cursor-pointer" onclick={(e) => { e.stopPropagation(); handleDeleteNestedBranch(nested, branch.name); }} title="Delete branch"><Icon name="lucide:trash-2" class="w-3.5 h-3.5" /></button>
 			</div>
 			{:else}
-			<div class="pointer-events-none absolute inset-y-0 right-0 flex items-center gap-1 pl-1 pr-2 bg-white/20 opacity-0 backdrop-blur-md supports-[backdrop-filter]:bg-white/10 transition-opacity group-hover:opacity-100 dark:bg-slate-900/20 dark:supports-[backdrop-filter]:bg-slate-900/10">
+			<div class="absolute inset-y-0 right-0 flex items-center gap-1 pl-1 pr-2 bg-white/20 backdrop-blur-md supports-[backdrop-filter]:bg-white/10 transition-opacity dark:bg-slate-900/20 dark:supports-[backdrop-filter]:bg-slate-900/10 {pushingBranch === branch.name ? 'opacity-100 pointer-events-auto' : 'pointer-events-none opacity-0 group-hover:opacity-100'}">
 				{#if !nestedPushed.has(branch.name) || branch.ahead > 0}
 					{#if pushingBranch === branch.name}
 						<div class="pointer-events-auto flex items-center justify-center w-7 h-7 rounded-md text-emerald-500"><Icon name="lucide:loader-circle" class="w-3.5 h-3.5 animate-spin" /></div>
@@ -3718,7 +3718,7 @@ ${bodies}`;
 										{#if commit.author}<span class="flex-1 min-w-0 text-xs text-slate-500 truncate">{commit.author}</span>{/if}
 									</div>
 								</div>
-								<div class="absolute right-1.5 top-1/2 -translate-y-1/2 flex items-center gap-0.5 shrink-0 opacity-0 group-hover/commit:opacity-100">
+								<div class="absolute right-1.5 top-1/2 -translate-y-1/2 flex items-center gap-0.5 shrink-0 transition-opacity {(i === 0 && pushingBranch === branch.name) ? 'opacity-100' : 'opacity-0 group-hover/commit:opacity-100'}">
 									<button type="button" class="flex items-center justify-center w-7 h-7 rounded-md text-slate-400 hover:text-violet-500 hover:bg-violet-500/10 transition-colors bg-transparent border-none cursor-pointer" onclick={(e) => { e.stopPropagation(); handleViewCommitDiffs(commit, nested.path); }} title="View all file diffs in this commit"><Icon name="lucide:file-diff" class="w-4 h-4" /></button>
 									{#if !branch.isCurrent}
 										<button type="button" class="flex items-center justify-center w-7 h-7 rounded-md text-slate-400 hover:text-emerald-500 hover:bg-emerald-500/10 transition-colors bg-transparent border-none cursor-pointer" onclick={(e) => { e.stopPropagation(); handleCherryPick(commit.hash, nested.path); }} title="Cherry-pick this commit onto {nested.info.current}"><Icon name="lucide:git-fork" class="w-4 h-4" /></button>
@@ -4900,7 +4900,7 @@ ${bodies}`;
 												</div>
 											</div>
 											{#if !branch.isCurrent}
-											<div class="pointer-events-none absolute inset-y-0 right-0 flex items-center gap-1 pl-1 pr-2 bg-white/20 opacity-0 backdrop-blur-md supports-[backdrop-filter]:bg-white/10 transition-opacity group-hover:opacity-100 dark:bg-slate-900/20 dark:supports-[backdrop-filter]:bg-slate-900/10">
+											<div class="absolute inset-y-0 right-0 flex items-center gap-1 pl-1 pr-2 bg-white/20 backdrop-blur-md supports-[backdrop-filter]:bg-white/10 transition-opacity dark:bg-slate-900/20 dark:supports-[backdrop-filter]:bg-slate-900/10 {pushingBranch === branch.name ? 'opacity-100 pointer-events-auto' : 'pointer-events-none opacity-0 group-hover:opacity-100'}">
 												<button type="button" class="pointer-events-auto flex items-center justify-center w-7 h-7 rounded-md text-slate-400 hover:bg-violet-500/10 hover:text-violet-500 transition-colors bg-transparent border-none cursor-pointer" onclick={(e) => { e.stopPropagation(); switchBranch(branch.name); }} title="Switch to this branch"><Icon name="lucide:arrow-right" class="w-3.5 h-3.5" /></button>
 												{#if !pushedBranchNames.has(branch.name)}
 													{#if pushingBranch === branch.name}
@@ -4913,7 +4913,7 @@ ${bodies}`;
 												<button type="button" class="pointer-events-auto flex items-center justify-center w-7 h-7 rounded-md text-slate-400 hover:bg-red-500/10 hover:text-red-500 transition-colors bg-transparent border-none cursor-pointer" onclick={(e) => { e.stopPropagation(); deleteBranch(branch.name); }} title="Delete branch"><Icon name="lucide:trash-2" class="w-3.5 h-3.5" /></button>
 										</div>
 										{:else}
-										<div class="pointer-events-none absolute inset-y-0 right-0 flex items-center gap-1 pl-1 pr-2 bg-white/20 opacity-0 backdrop-blur-md supports-[backdrop-filter]:bg-white/10 transition-opacity group-hover:opacity-100 dark:bg-slate-900/20 dark:supports-[backdrop-filter]:bg-slate-900/10">
+										<div class="absolute inset-y-0 right-0 flex items-center gap-1 pl-1 pr-2 bg-white/20 backdrop-blur-md supports-[backdrop-filter]:bg-white/10 transition-opacity dark:bg-slate-900/20 dark:supports-[backdrop-filter]:bg-slate-900/10 {pushingBranch === branch.name ? 'opacity-100 pointer-events-auto' : 'pointer-events-none opacity-0 group-hover:opacity-100'}">
 											{#if !pushedBranchNames.has(branch.name) || branch.ahead > 0}
 												{#if pushingBranch === branch.name}
 													<div class="pointer-events-auto flex items-center justify-center w-7 h-7 rounded-md text-emerald-500"><Icon name="lucide:loader-circle" class="w-3.5 h-3.5 animate-spin" /></div>
@@ -4960,7 +4960,7 @@ ${bodies}`;
 																	{#if commit.author}<span class="flex-1 min-w-0 text-xs text-slate-500 truncate">{commit.author}</span>{/if}
 																</div>
 															</div>
-														<div class="absolute right-1.5 top-1/2 -translate-y-1/2 flex items-center gap-0.5 shrink-0 opacity-0 group-hover/commit:opacity-100">
+														<div class="absolute right-1.5 top-1/2 -translate-y-1/2 flex items-center gap-0.5 shrink-0 transition-opacity {(i === 0 && pushingBranch === branch.name) ? 'opacity-100' : 'opacity-0 group-hover/commit:opacity-100'}">
 															<button type="button" class="flex items-center justify-center w-7 h-7 rounded-md text-slate-400 hover:text-violet-500 hover:bg-violet-500/10 transition-colors bg-transparent border-none cursor-pointer" onclick={(e) => { e.stopPropagation(); handleViewCommitDiffs(commit); }} title="View all file diffs in this commit"><Icon name="lucide:file-diff" class="w-4 h-4" /></button>
 															{#if !branch.isCurrent}
 																<button type="button" class="flex items-center justify-center w-7 h-7 rounded-md text-slate-400 hover:text-emerald-500 hover:bg-emerald-500/10 transition-colors bg-transparent border-none cursor-pointer" onclick={(e) => { e.stopPropagation(); handleCherryPick(commit.hash); }} title="Cherry-pick this commit onto {branchInfo?.current}"><Icon name="lucide:git-fork" class="w-4 h-4" /></button>
