@@ -2,9 +2,13 @@
 	import Icon from '$frontend/components/common/display/Icon.svelte';
 	import { getFileIcon } from '$frontend/utils/file-icon-mappings';
 	import { revealFile } from '$frontend/stores/ui/file-peek.svelte';
+	import { requestAiScrollReveal } from '$frontend/utils/ai-changes';
 
 	function handleClick() {
 		revealFile(filePath);
+		if (editIndex !== undefined && editIndex !== null) {
+			requestAiScrollReveal(filePath, editIndex);
+		}
 	}
 
 	interface Props {
@@ -13,9 +17,10 @@
 		iconColor?: string;
 		badges?: Array<{ text: string; color: string }>;
 		box?: boolean;
+		editIndex?: number | null;
 	}
 
-	const { filePath, fileName, iconColor, badges = [], box = true }: Props = $props();
+	const { filePath, fileName, iconColor, badges = [], box = true, editIndex = null }: Props = $props();
 
 	const displayFileName = $derived(fileName || filePath.split(/[/\\]/).pop() || filePath);
 </script>

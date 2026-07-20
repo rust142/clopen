@@ -16,9 +16,10 @@
 		onDiscard?: (path: string) => void;
 		onViewDiff?: (file: GitFileChange, section: string) => void;
 		onResolve?: (path: string) => void;
+		aiChangesSet?: Set<string>;
 	}
 
-	const { file, section, isActive = false, onStage, onUnstage, onDiscard, onViewDiff, onResolve }: Props = $props();
+	const { file, section, isActive = false, onStage, onUnstage, onDiscard, onViewDiff, onResolve, aiChangesSet = new Set<string>() }: Props = $props();
 
 	const statusCode = $derived(section === 'staged' ? file.indexStatus : file.workingStatus);
 	const statusLabel = $derived(getGitStatusLabel(statusCode));
@@ -30,6 +31,14 @@
 		return parts.join('/');
 	});
 	const fileIcon = $derived(getFileIcon(fileName) as IconName);
+
+	// AI changes indicator — file.path is relative; build absolute to match aiChangesSet
+	const hasAiChange = $derived(() => {
+		const base = projectState.currentProject?.path;
+		if (!base) return false;
+		const sep = base.includes('\\') ? '\\' : '/';
+		return aiChangesSet.has(`${base}${sep}${file.path}`);
+	});
 
 	function openInFilesPanel(e: MouseEvent) {
 		e.stopPropagation();
@@ -65,8 +74,16 @@
 		{/if}
 	</div>
 
-	<!-- Status badge -->
-	<span class="w-4 text-center text-sm font-bold {statusColor} shrink-0">{statusLabel}</span>
+	<!-- Status badge + AI dot -->
+	<span class="flex items-center gap-1 shrink-0">
+		{#if hasAiChange()}
+			<span
+				class="w-1.5 h-1.5 rounded-full bg-violet-500 dark:bg-violet-400"
+				title="Has AI changes"
+			></span>
+		{/if}
+		<span class="w-4 text-center text-sm font-bold {statusColor} shrink-0">{statusLabel}</span>
+	</span>
 
 	<!-- Actions - always visible -->
 	<div class="flex items-center gap-0.5 shrink-0">

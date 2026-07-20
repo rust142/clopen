@@ -1,19 +1,24 @@
 <script lang="ts">
 	import { revealFile } from '$frontend/stores/ui/file-peek.svelte';
+	import { requestAiScrollReveal } from '$frontend/utils/ai-changes';
 
 	interface Props {
 		filePath: string;
 		fileName?: string;
 		operation?: string;
 		badges?: string[];
+		editIndex?: number | null;
 	}
 
-	const { filePath, fileName, operation, badges = [] }: Props = $props();
+	const { filePath, fileName, operation, badges = [], editIndex = null }: Props = $props();
 
 	const displayFileName = $derived(fileName || filePath.split(/[/\\]/).pop() || filePath);
 
 	function handleClick() {
 		revealFile(filePath);
+		if (editIndex !== null) {
+			requestAiScrollReveal(filePath, editIndex);
+		}
 	}
 </script>
 
