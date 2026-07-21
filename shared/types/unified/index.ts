@@ -23,6 +23,12 @@ export type {
 	EngineInfo,
 	QwenProviderPresetId,
 	QwenProviderPreset,
+	PiAuthMode,
+	PiCredentialField,
+	PiProviderPreset,
+	ClineAuthMode,
+	ClineCredentialField,
+	ClineProviderPreset,
 } from './engine';
 
 // ── Tools ────────────────────────────────────────────────────

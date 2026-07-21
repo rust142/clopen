@@ -1,5 +1,7 @@
 <script lang="ts">
 	import ToolInstallCard from './ToolInstallCard.svelte';
+	import PiInfoCard from './PiInfoCard.svelte';
+	import ClineInfoCard from './ClineInfoCard.svelte';
 
 	interface Props {
 		showHeader?: boolean;
@@ -51,6 +53,10 @@
 				title="Qwen Code CLI"
 				description="Used by clopen to run the Qwen Code engine."
 			/>
+
+			<PiInfoCard />
+
+			<ClineInfoCard />
 		</div>
 	</section>
 

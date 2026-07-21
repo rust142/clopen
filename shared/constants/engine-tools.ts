@@ -40,7 +40,12 @@ export const ENGINE_BUILTIN_TOOLS: Record<EngineType, string[]> = {
 	// Codex — custom-prompt / core tool ids (best-effort).
 	codex: ['shell', 'apply_patch', 'update_plan', 'read_file', 'web_search'],
 	// Qwen Code — snake_case tool names as passed to canUseTool (best-effort).
-	qwen: ['run_shell_command', 'read_file', 'write_file', 'read_many_files', 'grep', 'glob', 'ls', 'web_fetch', 'web_search']
+	qwen: ['run_shell_command', 'read_file', 'write_file', 'read_many_files', 'grep', 'glob', 'ls', 'web_fetch', 'web_search'],
+	// Pi — lowercase built-in tool ids, enforced at the `tool_call` extension hook.
+	pi: ['bash', 'read', 'edit', 'write', 'grep', 'find', 'ls', 'ask_question'],
+	// Cline — @cline/sdk default tool names, enforced via `toolPolicies` (a denied
+	// tool is set `{ enabled: false }`, hiding it from the model entirely).
+	cline: ['read_files', 'search_codebase', 'run_commands', 'fetch_web_content', 'apply_patch', 'editor', 'skills', 'ask_question']
 };
 
 /**
@@ -52,5 +57,9 @@ export const ENGINE_TOOLS_BEST_EFFORT: Record<EngineType, boolean> = {
 	opencode: false,
 	copilot: false,
 	codex: true,
-	qwen: false
+	qwen: false,
+	// Pi enforces allow/deny at the in-process `tool_call` hook (real, not best-effort).
+	pi: false,
+	// Cline enforces allow/deny via `toolPolicies` (`{ enabled: false }` = real).
+	cline: false
 };

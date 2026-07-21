@@ -36,8 +36,23 @@ mandatory files; optional files use the canonical names from §2.6.
 - [ ] `stream.ts` (mandatory) → class `NewEngineEngine implements AIEngine`.
       Pick a template: `claude/stream.ts` (in-process SDK),
       `opencode/stream.ts` (subprocess), `copilot/stream.ts` (in-process
-      with construction-time credential), or `qwen/stream.ts` (CLI subprocess
-      via SDK with auth-blob swap).
+      with construction-time credential), `qwen/stream.ts` (CLI subprocess
+      via SDK with auth-blob swap), `pi/stream.ts` (in-process SDK with an
+      on-disk session store), or `cline/stream.ts` (in-process, **session-less**
+      stateless `Agent`).
+- [ ] **Fork / checkpoints (mandatory, easy to miss).** Every resume MUST
+      fork so branches don't cross-contaminate — see §10.10. Native-fork SDKs
+      pass a flag; on-disk SDKs copy the session file; a **session-less** SDK
+      (`cline`) mints a fresh session id per turn and copies the parent
+      transcript forward in memory (never reuse the `resume` id as the store
+      key). Symptom of getting it wrong: every persisted assistant message
+      shares one session id, and an undo+continue answers with the sibling
+      branch's history.
+- [ ] **Sub-agents (if the engine has no native `Task`/`Agent` tool).** A
+      session-less/bare-loop SDK must **synthesize** the `Agent` tool
+      (`cline/agent-tool.ts`), register it + `toolPolicies.Agent`, route the
+      sub-agent's messages into the stream tagged with `parent.toolUseId`, and
+      push **tool_use only** as sub-activities — see §10.15.
 - [ ] `models.ts` (mandatory) → static `NEWENGINE_MODELS: EngineModel[]`
       OR `fetchNewengineModels(...): Promise<EngineModel[]>` (dynamic;
       return `[]` on failure — see §4.5).
@@ -98,13 +113,25 @@ mandatory files; optional files use the canonical names from §2.6.
 
 ### Stage 6 — Settings → Engines
 
-- [ ] Add a panel to `AIEnginesSettings.svelte`: the card appears
-      automatically since `ENGINES` already has the new entry. Implement
-      the setup flow:
-  - Load status via `ws.http('engine:newengine-status', {})`.
-  - Subscribe to server-emit events for login progress.
-  - After save: `newengineStore.refresh()` +
+- [ ] Add `frontend/components/settings/engines/panels/NewEnginePanel.svelte`
+      and wire it into `AIEnginesSettings.svelte`: its selector tile appears
+      automatically (`ENGINES` has the new entry), and the shell renders the
+      panel in the `{#if activeEngine === 'newengine'}` branch. Add the
+      engine's status shape to `panels/panel-types.ts` and a
+      `refreshNewEngineStatus()` in the shell (fetched on mount for the grid,
+      passed to the panel as `onRefreshStatus`). Implement the setup flow in
+      the panel:
+  - Receive `status` + `isLoading` (+ `onRefreshStatus` if it mutates
+    accounts) as props; read the account list from its own store.
+  - Load status via `ws.http('engine:newengine-status', {})` (in the shell).
+  - Subscribe to server-emit events for login progress (in the panel's
+    `onMount`, cleaned up in `onDestroy`).
+  - After save: `newengineStore.refresh()` + `onRefreshStatus()` +
     `modelStore.refreshModels('newengine')`.
+  - If the engine has a browser/device auth flow, factor the auth markup into
+    a `{#snippet}` and render it both in the "Add Account" area and in the
+    account edit form (in-place re-auth), gated on `newengineReauthAccountId`
+    — mirror `ClaudeCodePanel`/`CodexPanel`/`PiPanel`.
 
 ### Stage 7 — Settings → System Tools
 
